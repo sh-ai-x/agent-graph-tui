@@ -1,0 +1,23 @@
+# Go
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# dev-kit session data
+.dev-kit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+# dev-kit harness artifacts (session-scoped)
+.claude/
+logs/
+tools/
