@@ -1,0 +1,6 @@
+{
+  "tdd_required": false,
+  "reason": "Literal string rename (tmux-tui -> agent-graph-tui) across main.go and README.md; no behavioral change, no new test surface.",
+  "set_by": "fix/rename-strings rename-strings task",
+  "set_at": "2026-08-10T21:00:00Z"
+}
