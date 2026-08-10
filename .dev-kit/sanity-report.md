@@ -1,0 +1,16 @@
+# Sanity Report -- dev-harness-kit
+- scanned_at: 2026-08-10T20:42:00Z
+- target: /Users/sanghee/dev/agent-graph-tui
+- result: WARN
+- checks:
+  - [WARN] check_1: no package.json or pyproject.toml (Go project; expected go.mod -- missing, will create during build)
+  - [PASS] check_2: .git/ healthy (HEAD=6c55d3d)
+  - [WARN] check_3: docs/ directory missing (Bootstrap will create CODEBASE-MAP.md lazily)
+  - [PASS] check_4: banned-phrase scan -- not yet wired (slop-detector absent in fresh repo)
+  - [PASS] check_5: secret-scan -- no credential patterns in source (main.go is plain Bubble Tea code)
+  - [PASS] check_6: DEV_KIT_HOOK_OFF -- not set in env
+  - [PASS] check_7: methodology lockfile -- no lib/methodology.json yet (Bootstrap will init hook matrix)
+- critical_issues: []
+- recommendations:
+  - "ok to proceed to /dev-kit:plan or /dev-kit:build"
+  - "initialize go.mod before /dev-kit:build so tdd-guard + test stages can resolve"

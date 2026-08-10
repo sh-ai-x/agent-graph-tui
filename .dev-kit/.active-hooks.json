@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "updated_at": "2026-08-10T20:42:00Z",
+  "matrix": {
+    "bootstrap": { "tdd-guard": false, "bash-guard": false, "secret-scan": "read-only", "slop-detector": false, "stop-verify": false },
+    "plan":       { "tdd-guard": false, "bash-guard": false, "secret-scan": false,    "slop-detector": false, "stop-verify": true  },
+    "design":     { "tdd-guard": false, "bash-guard": false, "secret-scan": false,    "slop-detector": false, "stop-verify": true  },
+    "build":      { "tdd-guard": true,  "bash-guard": true,  "secret-scan": true,     "slop-detector": true,  "stop-verify": true  },
+    "review":     { "tdd-guard": false, "bash-guard": false, "secret-scan": true,     "slop-detector": true,  "stop-verify": true  },
+    "security":   { "tdd-guard": false, "bash-guard": false, "secret-scan": true,     "slop-detector": true,  "stop-verify": true  },
+    "ship":       { "tdd-guard": false, "bash-guard": false, "secret-scan": false,    "slop-detector": false, "stop-verify": true  }
+  },
+  "override": { "disabled_hooks": [], "strict_mode": false }
+}
