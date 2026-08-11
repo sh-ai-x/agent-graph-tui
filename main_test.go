@@ -42,3 +42,29 @@ func TestParseSessionLine_NonIntegerWindows(t *testing.T) {
 		t.Errorf("expected ok=false for non-integer windows, got true")
 	}
 }
+
+// Session names beginning with '-' could be parsed by tmux as a flag argument
+// when re-passed via exec.Command ("tmux", "kill-session", "-t", name).
+// Reject them at the parser boundary to avoid argument-injection.
+func TestParseSessionLine_LeadingDashName(t *testing.T) {
+	if _, ok := parseSessionLine("-evil|3|2026-08-11|0"); ok {
+		t.Errorf("expected ok=false for leading-dash name, got true")
+	}
+}
+
+func TestParseSessionLine_NegativeWindows(t *testing.T) {
+	if _, ok := parseSessionLine("work|-3|2026-08-11|0"); ok {
+		t.Errorf("expected ok=false for negative windows, got true")
+	}
+}
+
+// tmux session names MAY contain '|'. The parser rejects them in this
+// scaffold (uses SplitN with hard arity = 4). v2 should switch the format
+// string to a separator tmux forbids (e.g. ":") and update the parser
+// accordingly. Documented as a known limitation; the regression is locked
+// in here so any future change forces an explicit decision.
+func TestParseSessionLine_PipeInName_RejectedByDesign(t *testing.T) {
+	if _, ok := parseSessionLine("foo|bar|2|2026-08-11|attached"); ok {
+		t.Errorf("expected ok=false (scaffold limitation); v2 must switch to a tmux-forbidden separator")
+	}
+}

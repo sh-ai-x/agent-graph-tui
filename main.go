@@ -27,16 +27,18 @@ func (s session) Title() string       { return s.name }
 func (s session) Description() string { return fmt.Sprintf("%d windows · %s", s.windows, s.created) }
 func (s session) FilterValue() string { return s.name }
 
+// parseSessionLine parses one pipe-delimited tmux session line of the form
+// "name|windows|created|attached". Returns ok=false on malformed input.
 func parseSessionLine(line string) (session, bool) {
-	parts := strings.Split(line, "|")
+	parts := strings.SplitN(line, "|", 4)
 	if len(parts) != 4 {
 		return session{}, false
 	}
-	if parts[0] == "" {
+	if parts[0] == "" || parts[0][0] == '-' {
 		return session{}, false
 	}
 	windows, err := strconv.Atoi(parts[1])
-	if err != nil {
+	if err != nil || windows < 0 {
 		return session{}, false
 	}
 	return session{
@@ -47,15 +49,17 @@ func parseSessionLine(line string) (session, bool) {
 	}, true
 }
 
+// loadSessions shells out to `tmux list-sessions` and parses each line.
+// Returns a user-facing error when no tmux server is running.
 func loadSessions() ([]session, error) {
 	out, err := exec.Command("tmux", "list-sessions", "-F",
-		"#{session_name}|#{session_windows}|#{session_created_string}|#{session_attached}").Output()
+		"#{session_name}|#{session_windows}|#{session_created_string}|#{session_attached}").CombinedOutput()
 	if err != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && strings.Contains(string(exitErr.Stderr), "no server running") {
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return nil, fmt.Errorf("no tmux server running — start one with `tmux new -s name`")
 		}
-		return nil, err
+		return nil, fmt.Errorf("tmux list-sessions: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	var sessions []session
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -69,11 +73,13 @@ func loadSessions() ([]session, error) {
 	return sessions, nil
 }
 
+// listWindows shells out to `tmux list-windows` for the given session.
+// Returns placeholder text on error or when the session has no windows.
 func listWindows(sessionName string) []string {
 	out, err := exec.Command("tmux", "list-windows", "-t", sessionName, "-F",
-		"#{window_index} #{window_name} (#{window_panes} panes)").Output()
+		"#{window_index} #{window_name} (#{window_panes} panes)").CombinedOutput()
 	if err != nil {
-		return []string{"(unable to read windows)"}
+		return []string{fmt.Sprintf("(unable to read windows: %s)", strings.TrimSpace(string(out)))}
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) == 1 && lines[0] == "" {
@@ -82,6 +88,9 @@ func listWindows(sessionName string) []string {
 	return lines
 }
 
+// renderDetail formats a session's detail pane. listWindows is intentionally
+// called here; callers must gate by selection change to avoid spawning tmux
+// on every event.
 func renderDetail(s session) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Name:     %s\n", s.name)
@@ -98,12 +107,13 @@ func renderDetail(s session) string {
 }
 
 type model struct {
-	list     list.Model
-	detail   viewport.Model
-	sessions []session
-	width    int
-	height   int
-	err      error
+	list       list.Model
+	detail     viewport.Model
+	sessions   []session
+	width      int
+	height     int
+	err        error
+	lastDetail int // index of the session whose detail was last rendered; -1 = none
 }
 
 var (
@@ -111,6 +121,7 @@ var (
 	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Padding(0, 1)
 	paneStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#3C3C3C"))
 	focusedStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#7D56F4"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Padding(0, 1)
 )
 
 func initialModel() (model, error) {
@@ -125,19 +136,24 @@ func initialModel() (model, error) {
 	l := list.New(items, list.NewDefaultDelegate(), 30, 20)
 	l.Title = "tmux sessions"
 	l.SetShowStatusBar(false)
-	m := model{list: l, sessions: sessions, detail: viewport.New(40, 20)}
-	if len(sessions) > 0 {
-		m.detail.SetContent(renderDetail(sessions[0]))
-	}
+	m := model{list: l, sessions: sessions, detail: viewport.New(40, 20), lastDetail: -1}
 	return m, nil
 }
 
 func switchClient(name string) error {
-	return exec.Command("tmux", "switch-client", "-t", name).Run()
+	out, err := exec.Command("tmux", "switch-client", "-t", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux switch-client: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func killSession(name string) error {
-	return exec.Command("tmux", "kill-session", "-t", name).Run()
+	out, err := exec.Command("tmux", "kill-session", "-t", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tmux kill-session: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -151,6 +167,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			leftW = 24
 		}
 		rightW := m.width - leftW - 2
+		if rightW < 0 {
+			rightW = 0
+		}
+		if m.height < 4 {
+			m.height = 4
+		}
 		m.list.SetSize(leftW, m.height-4)
 		m.detail.Width = rightW
 		m.detail.Height = m.height - 4
@@ -161,26 +183,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			if sel, ok := m.list.SelectedItem().(session); ok {
-				_ = switchClient(sel.name)
+				if err := switchClient(sel.name); err != nil {
+					m.err = err
+					return m, nil
+				}
 				return m, tea.Quit
 			}
 		case "K":
 			if sel, ok := m.list.SelectedItem().(session); ok {
-				if err := killSession(sel.name); err == nil {
-					m.err = nil
-					if reloaded, err := loadSessions(); err == nil {
-						m.sessions = reloaded
-						items := make([]list.Item, len(reloaded))
-						for i, s := range reloaded {
-							items[i] = s
-						}
-						m.list.SetItems(items)
-						if len(reloaded) > 0 {
-							m.detail.SetContent(renderDetail(reloaded[0]))
-						}
-					}
-				} else {
+				if err := killSession(sel.name); err != nil {
 					m.err = err
+					return m, nil
+				}
+				if reloaded, err := loadSessions(); err != nil {
+					m.err = err
+					return m, nil
+				} else {
+					m.sessions = reloaded
+					items := make([]list.Item, len(reloaded))
+					for i, s := range reloaded {
+						items[i] = s
+					}
+					m.list.SetItems(items)
+					if len(reloaded) > 0 {
+						m.detail.SetContent(renderDetail(reloaded[0]))
+						m.lastDetail = 0
+					}
 				}
 			}
 			return m, nil
@@ -190,8 +218,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
-	if sel, ok := m.list.SelectedItem().(session); ok {
-		m.detail.SetContent(renderDetail(sel))
+	// Only refresh the detail pane when the selected index actually changes.
+	// Calling renderDetail → listWindows on every event would spawn a tmux
+	// subprocess per keystroke / mouse move / tick; refresh only on selection
+	// change (fixes the Bubble-Tea-purity critical finding from /dev-kit:review).
+	idx := m.list.Index()
+	if idx >= 0 && idx != m.lastDetail {
+		if idx < len(m.sessions) {
+			m.detail.SetContent(renderDetail(m.sessions[idx]))
+		}
+		m.lastDetail = idx
 	}
 	return m, cmd
 }
@@ -203,11 +239,15 @@ func (m model) View() string {
 	left := focusedStyle.Render(m.list.View())
 	right := focusedStyle.Render(m.detail.View())
 	help := helpStyle.Render("enter switch · K kill · n new · q quit")
-	return lipgloss.JoinVertical(lipgloss.Left,
+	body := lipgloss.JoinVertical(lipgloss.Left,
 		titleStyle.Render("tmux-tui"),
 		lipgloss.JoinHorizontal(lipgloss.Top, left, right),
 		help,
 	)
+	if m.err != nil {
+		body = errorStyle.Render("error: "+m.err.Error()) + "\n" + body
+	}
+	return body
 }
 
 func main() {
