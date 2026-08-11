@@ -1,0 +1,14 @@
+{
+  "step": 2,
+  "name": "bubbletea-model-skeleton",
+  "phase": "tmux-tui-scaffold",
+  "branch": "plan/tmux-tui-scaffold-step2",
+  "status": "completed",
+  "exit_code": 0,
+  "started_at": "2026-08-11T03:34:07Z",
+  "finished_at": "2026-08-11T03:34:07Z",
+  "duration_seconds": 14,
+  "stdout": "go vet ./...: exit 0\ngo build ./...: exit 0\ngo test -count=1 ./...: ok 5.478s\ngofmt -l .: empty\n",
+  "stderr": "",
+  "summary": "Bubble Tea model + lipgloss styles + WindowSizeMsg handler; all gates green."
+}
