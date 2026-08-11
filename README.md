@@ -1,56 +1,70 @@
-# tmux-tui
+# agent-graph-tui
 
-Terminal UI for browsing and switching tmux sessions, built with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
+Lightweight terminal viewer for Claude Code / Codex agent execution graphs.
 
-## Features
+Read-only. No daemon. Renders a session JSONL as a live-tail, scrollable tree of
+`user` / `assistant text` / `tool call` / `tool result` nodes.
 
-- Lists all running tmux sessions with window count and creation time
-- Switches the active client to the selected session
-- Kills sessions from the keyboard
-- Renders window details in a side pane
+```
+$ agent-graph-tui ~/.claude/projects/foo/abc.jsonl
 
-## Requirements
+agent-graph-tui /Users/you/.claude/projects/foo/abc.jsonl
+─────────────────────────────────────────────────────────────────
+user        "fix the bug"
+assistant   "looking at parser.rs..."
+tool        Read ./src/parser.rs                ✓
+    └─ result  <240 bytes>                       ✓
+tool        Edit ./src/parser.rs                ✓
+    └─ result  ok                                ✓
+assistant   "ship it"
 
-- Go 1.26+
-- A running tmux server (`tmux new -s name` to start one)
+ 3/6   ↑↓ navigate   q quit
+```
+
+## Why
+
+[herdr](https://herdr.dev/) runs an `herdr-server` daemon + client + pty layer
+to multiplex agents, which is overkill when you only want to *see* one. This
+is a single Rust binary with no runtime deps: cold-starts in ~20 ms and lives
+in ~3–5 MB.
 
 ## Install
 
 ```sh
-go install github.com/sh-ai-x/agent-graph-tui@latest
+cargo install --path .
 ```
 
-Or build locally:
+Or:
 
 ```sh
-go build -o bin/agent-graph-tui .
-./bin/agent-graph-tui
+git clone https://github.com/sh-ai-x/agent-graph-tui
+cd agent-graph-tui
+cargo build --release
+./target/release/agent-graph-tui
+```
+
+## Usage
+
+```sh
+agent-graph-tui                     # auto-detect most recent ~/.claude session
+agent-graph-tui session.jsonl       # explicit path
+agent-graph-tui < pipe-of-jsonl     # plain-text fallback (non-TTY)
 ```
 
 ## Keys
 
-| Key       | Action            |
-|-----------|-------------------|
-| `enter`   | switch to session |
-| `K`       | kill session      |
-| `n`       | new (run `tmux new -s name` outside the TUI) |
-| `q`       | quit              |
+| Key     | Action            |
+|---------|-------------------|
+| `j` / ↓ | next row          |
+| `k` / ↑ | prev row          |
+| `g`     | jump to top       |
+| `G`     | jump to bottom    |
+| `q` / ⎋ | quit              |
 
-## Development
+## Build
 
-```sh
-go vet ./...          # static analysis
-go build ./...        # compile
-go test -race ./...   # unit tests with race detector
-gofmt -l .            # formatting check (empty = OK)
-```
+Requires Rust 1.75+ (edition 2021). Tested on macOS 14 with rustc 1.89.
 
-## Architecture
+## License
 
-Single-file scaffold (`main.go`):
-
-- `session` struct + `parseSessionLine` + `loadSessions`/`listWindows` tmux exec wrappers
-- Bubble Tea `model` (list + viewport) with lipgloss styling
-- Pure `Update`; side-effects through key handlers only
-
-See `phases/tmux-tui-scaffold/` for the step-by-step plan + verification logs.
+Apache-2.0
