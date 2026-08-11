@@ -1,0 +1,14 @@
+{
+  "step": 3,
+  "name": "tmux-exec-wiring",
+  "phase": "tmux-tui-scaffold",
+  "branch": "plan/tmux-tui-scaffold-step3",
+  "status": "completed",
+  "exit_code": 0,
+  "started_at": "2026-08-11T03:37:35Z",
+  "finished_at": "2026-08-11T03:37:35Z",
+  "duration_seconds": 11,
+  "stdout": "go vet ./...: exit 0\ngo build ./...: exit 0\ngo test -count=1 ./...: ok 12.795s\ngofmt -l .: empty\n",
+  "stderr": "",
+  "summary": "enter/K/n keys wired to switchClient/killSession/quit; all gates green."
+}
