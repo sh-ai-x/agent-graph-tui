@@ -132,6 +132,14 @@ func initialModel() (model, error) {
 	return m, nil
 }
 
+func switchClient(name string) error {
+	return exec.Command("tmux", "switch-client", "-t", name).Run()
+}
+
+func killSession(name string) error {
+	return exec.Command("tmux", "kill-session", "-t", name).Run()
+}
+
 func (m model) Init() tea.Cmd { return nil }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -150,6 +158,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "enter":
+			if sel, ok := m.list.SelectedItem().(session); ok {
+				_ = switchClient(sel.name)
+				return m, tea.Quit
+			}
+		case "K":
+			if sel, ok := m.list.SelectedItem().(session); ok {
+				if err := killSession(sel.name); err == nil {
+					m.err = nil
+					if reloaded, err := loadSessions(); err == nil {
+						m.sessions = reloaded
+						items := make([]list.Item, len(reloaded))
+						for i, s := range reloaded {
+							items[i] = s
+						}
+						m.list.SetItems(items)
+						if len(reloaded) > 0 {
+							m.detail.SetContent(renderDetail(reloaded[0]))
+						}
+					}
+				} else {
+					m.err = err
+				}
+			}
+			return m, nil
+		case "n":
 			return m, tea.Quit
 		}
 	}
