@@ -1,0 +1,25 @@
+# Go (legacy; tmux-tui phases kept for history)
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# dev-kit session data
+.dev-kit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+fixtures/big.jsonl
