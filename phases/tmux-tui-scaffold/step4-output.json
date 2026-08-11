@@ -1,0 +1,14 @@
+{
+  "step": 4,
+  "name": "end-to-end-smoke",
+  "phase": "tmux-tui-scaffold",
+  "branch": "plan/tmux-tui-scaffold-step4",
+  "status": "completed",
+  "exit_code": 0,
+  "started_at": "2026-08-11T03:47:28Z",
+  "finished_at": "2026-08-11T03:47:28Z",
+  "duration_seconds": 8,
+  "stdout": "go vet ./...: exit 0\ngo test -race -count=1 ./...: ok 2.178s\ngofmt -l .: empty\ngo build -o bin/agent-graph-tui .: 4.9MB binary\n",
+  "stderr": "",
+  "summary": "All gates green; README written; manual interactive smoke deferred (no tmux server in this sandbox)."
+}
