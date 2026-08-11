@@ -1,0 +1,14 @@
+{
+  "step": 0,
+  "name": "bootstrap-go-module",
+  "phase": "tmux-tui-scaffold",
+  "branch": "plan/tmux-tui-scaffold-step0",
+  "status": "completed",
+  "exit_code": 0,
+  "started_at": "2026-08-11T12:00:40+09:00",
+  "finished_at": "2026-08-11T03:16:16Z",
+  "duration_seconds": 45,
+  "stdout": "go mod tidy: bubbles v1.0.0, bubbletea v1.3.10, lipgloss v1.1.0\ngo vet ./...: exit 0\ngo build -o bin/agent-graph-tui .: exit 0 (3.4MB binary)\n",
+  "stderr": "",
+  "summary": "go.mod + go.sum + main.go stub committed; vet + build green."
+}
