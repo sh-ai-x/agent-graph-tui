@@ -6,6 +6,10 @@ description = "Lightweight terminal viewer for Claude Code / Codex agent executi
 license = "Apache-2.0"
 repository = "https://github.com/sh-ai-x/agent-graph-tui"
 
+[lib]
+name = "agent_graph_tui"
+path = "src/lib.rs"
+
 [dependencies]
 ratatui        = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm      = { version = "0.28", default-features = false, features = ["events", "use-dev-tty"] }

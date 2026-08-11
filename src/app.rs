@@ -10,6 +10,10 @@ use crate::parser::Session as ParseSession;
 use crate::render;
 use crate::tree;
 
+/// Vertical slices of the frame: 3-line header, body, 1-line footer.
+const HEADER_HEIGHT: u16 = 3;
+const FOOTER_HEIGHT: u16 = 1;
+
 pub fn run<B: Backend>(term: &mut Terminal<B>, mut session: ParseSession) -> std::io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(
@@ -41,6 +45,13 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut session: ParseSession) -> std
             last_rescan = Instant::now();
         }
 
+        // Body viewport height = terminal height minus header & footer.
+        let viewport = term
+            .size()
+            .map(|s| s.height.saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT) as usize)
+            .unwrap_or(20)
+            .max(1);
+
         if last_draw.elapsed() >= Duration::from_millis(33) {
             term.draw(|f| render::draw(f, &snap, selected, scroll, &path_str))?;
             last_draw = Instant::now();
@@ -49,7 +60,7 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut session: ParseSession) -> std
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press
-                    && handle_key(k, &mut selected, &mut scroll, snap.rows.len())
+                    && handle_key(k, &mut selected, &mut scroll, snap.rows.len(), viewport)
                 {
                     break;
                 }
@@ -59,15 +70,20 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut session: ParseSession) -> std
     Ok(())
 }
 
-fn handle_key(k: KeyEvent, selected: &mut usize, scroll: &mut usize, total: usize) -> bool {
-    let visible = total.saturating_sub(*scroll).max(1);
+fn handle_key(
+    k: KeyEvent,
+    selected: &mut usize,
+    scroll: &mut usize,
+    total: usize,
+    viewport: usize,
+) -> bool {
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => true,
         KeyCode::Char('j') | KeyCode::Down => {
-            if *selected + 1 < total {
+            if total > 0 && *selected + 1 < total {
                 *selected += 1;
-                if *selected >= *scroll + visible {
-                    *scroll += 1;
+                if *selected >= *scroll + viewport {
+                    *scroll = *selected + 1 - viewport;
                 }
             }
             false
@@ -89,7 +105,7 @@ fn handle_key(k: KeyEvent, selected: &mut usize, scroll: &mut usize, total: usiz
         KeyCode::Char('G') => {
             if total > 0 {
                 *selected = total - 1;
-                *scroll = total.saturating_sub(visible);
+                *scroll = total.saturating_sub(viewport);
             }
             false
         }

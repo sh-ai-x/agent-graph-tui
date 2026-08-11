@@ -1,7 +1,10 @@
 //! Streaming parser for Claude Code / Codex session JSONL files.
 //!
-//! Each line is one event. Unknown shapes are kept as `Unknown` so a single
-//! malformed line never aborts the run.
+//! Each line is one JSON record. A single assistant turn may carry several
+//! content blocks (`text` + `tool_use` + `tool_use` for parallel tool calls),
+//! so [`parse_line`] returns `Vec<Event>` to surface them all. CRLF line
+//! endings and truncate-then-rewrite (Claude Code session rotation) are
+//! handled in [`Session::rescan_from`].
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -65,37 +68,72 @@ impl Session {
     }
 
     /// Re-read the file from `offset` bytes and append any newly parsed events.
-    /// Returns the new offset.
+    /// Returns the new offset, or `0` if the file was rotated (size shrank below
+    /// the previous cursor).
     pub fn rescan_from(&mut self, offset: u64) -> std::io::Result<u64> {
+        let file_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let seek_to = if file_size < offset { 0 } else { offset };
+
+        if seek_to != offset {
+            // File was rotated/truncated: drop prior parse so a fresh start is
+            // consistent with the truncated-and-rewritten contents.
+            self.events.clear();
+        }
+
         let mut f = File::open(&self.path)?;
-        f.seek(SeekFrom::Start(offset))?;
-        let reader = BufReader::new(f);
-        let mut len: u64 = 0;
-        for line in reader.lines() {
-            let Ok(l) = line else { break };
-            len = len.saturating_add(l.len() as u64 + 1);
-            if l.trim().is_empty() {
+        f.seek(SeekFrom::Start(seek_to))?;
+        let mut reader = BufReader::new(f);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut consumed: u64 = 0;
+
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            consumed += n as u64;
+
+            let line = std::str::from_utf8(&buf).unwrap_or("");
+            let trimmed = line.trim_end_matches(|c| c == '\n' || c == '\r');
+            if trimmed.is_empty() {
                 continue;
             }
-            match parse_line(&l) {
-                Some(ev) => self.events.push(ev),
-                None => self.events.push(Event::Unknown {
+
+            let mut events = parse_line(trimmed);
+            if events.is_empty() {
+                events.push(Event::Unknown {
                     ts: String::new(),
-                    raw: truncate(&l, 240),
-                }),
+                    raw: truncate(trimmed, 240),
+                });
             }
+            self.events.extend(events);
         }
-        Ok(offset + len)
+
+        Ok(seek_to + consumed)
     }
 }
 
-fn parse_line(line: &str) -> Option<Event> {
-    let raw: Raw = serde_json::from_str(line).ok()?;
+/// Parse one JSONL record into zero or more events.
+///
+/// Returning `Vec<Event>` instead of `Option<Event>` lets a single assistant
+/// turn emit one event per content block (Claude Code routinely produces
+/// text + multiple parallel `tool_use` blocks in a single turn).
+pub fn parse_line(line: &str) -> Vec<Event> {
+    let raw: Raw = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
     let ts = raw.timestamp;
+    let mut events: Vec<Event> = Vec::new();
 
     if raw.r#type == "user" {
         if let Some(text) = content_text(&raw.message) {
-            return Some(Event::User { ts, text });
+            events.push(Event::User {
+                ts: ts.clone(),
+                text,
+            });
         }
         if let Some(blocks) = raw.message.get("content").and_then(|c| c.as_array()) {
             for b in blocks {
@@ -114,7 +152,7 @@ fn parse_line(line: &str) -> Option<Event> {
                         })
                         .unwrap_or_default();
                     let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    return Some(Event::ToolResult {
+                    events.push(Event::ToolResult {
                         ts: ts.clone(),
                         tool_use_id: id,
                         output: truncate(&out, 1024),
@@ -123,6 +161,7 @@ fn parse_line(line: &str) -> Option<Event> {
                 }
             }
         }
+        return events;
     }
 
     if raw.r#type == "assistant" {
@@ -135,7 +174,10 @@ fn parse_line(line: &str) -> Option<Event> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        return Some(Event::AssistantText { ts: ts.clone(), text });
+                        events.push(Event::AssistantText {
+                            ts: ts.clone(),
+                            text,
+                        });
                     }
                     Some("tool_use") => {
                         let id = b
@@ -148,11 +190,8 @@ fn parse_line(line: &str) -> Option<Event> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("?")
                             .to_string();
-                        let input = b
-                            .get("input")
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
-                        return Some(Event::ToolCall {
+                        let input = b.get("input").map(|v| v.to_string()).unwrap_or_default();
+                        events.push(Event::ToolCall {
                             ts: ts.clone(),
                             id,
                             name,
@@ -162,13 +201,17 @@ fn parse_line(line: &str) -> Option<Event> {
                     _ => {}
                 }
             }
+            if !events.is_empty() {
+                return events;
+            }
         }
         if let Some(text) = content_text(&raw.message) {
-            return Some(Event::AssistantText { ts, text });
+            events.push(Event::AssistantText { ts, text });
         }
+        return events;
     }
 
-    None
+    Vec::new()
 }
 
 fn content_text(msg: &Value) -> Option<String> {
@@ -200,4 +243,126 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_user_text_into_one_event() {
+        let line = r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"t0"}"#;
+        let evs = parse_line(line);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            Event::User { ts, text } => {
+                assert_eq!(ts, "t0");
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected User, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_assistant_with_multi_block_content_emits_one_event_per_block() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[
+            {"type":"text","text":"thinking"},
+            {"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"/x"}},
+            {"type":"tool_use","id":"toolu_2","name":"Bash","input":{"cmd":"ls"}}
+        ]},"timestamp":"t1"}"#;
+        let evs = parse_line(line);
+        assert_eq!(evs.len(), 3, "must emit one event per block");
+        assert!(matches!(evs[0], Event::AssistantText { ref text, .. } if text == "thinking"));
+        assert!(
+            matches!(&evs[1], Event::ToolCall { id, name, .. } if id == "toolu_1" && name == "Read")
+        );
+        assert!(
+            matches!(&evs[2], Event::ToolCall { id, name, .. } if id == "toolu_2" && name == "Bash")
+        );
+    }
+
+    #[test]
+    fn parses_user_with_tool_result_including_is_error() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_1","content":"boom","is_error":true}
+        ]},"timestamp":"t2"}"#;
+        let evs = parse_line(line);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            Event::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_1");
+                assert!(*is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_json_returns_empty_vec() {
+        let evs = parse_line("not json");
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn rescan_with_crlf_line_endings_advances_offset_to_file_size() {
+        let path = std::env::temp_dir().join("agent-graph-tui-test-crlf.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let line1 = br#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"t0"}"#;
+        let line2 = br#"{"type":"user","message":{"role":"user","content":"there"},"timestamp":"t1"}"#;
+        let mut body = Vec::new();
+        body.extend_from_slice(line1);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(line2);
+        body.extend_from_slice(b"\r\n");
+        std::fs::write(&path, &body).unwrap();
+
+        // Build session directly to avoid double-rescan via Session::open().
+        let mut s = Session {
+            path: path.clone(),
+            events: Vec::new(),
+        };
+        let new_offset = s.rescan_from(0).unwrap();
+        assert_eq!(s.events.len(), 2);
+        assert_eq!(
+            new_offset,
+            body.len() as u64,
+            "offset must match raw file size (CRLF = 2 bytes/line, not 1)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rescan_after_file_rotation_resets_cursor() {
+        let path = std::env::temp_dir().join("agent-graph-tui-test-rotate.jsonl");
+        let _ = std::fs::remove_file(&path);
+        // Initial file: single user message.
+        std::fs::write(
+            &path,
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"v1\"},\"timestamp\":\"t0\"}\n",
+        )
+        .unwrap();
+        let mut s = Session::open(&path).unwrap();
+        assert_eq!(s.events.len(), 1);
+
+        // Simulate Claude Code rotation: truncate + rewrite with different content.
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"v2\"},\"timestamp\":\"t1\"}\n",
+        );
+        body.extend_from_slice(
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"v3\"},\"timestamp\":\"t2\"}\n",
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        // Caller passes an offset that's past the post-rotation EOF; parser
+        // must detect the shrinkage and reset to byte 0, re-reading the file.
+        let new_offset = s.rescan_from(10_000).unwrap();
+        assert_eq!(new_offset, body.len() as u64, "rotation must re-read from byte 0");
+        assert_eq!(s.events.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
 }

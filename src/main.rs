@@ -3,16 +3,12 @@
 //! Reads a Claude Code / Codex session JSONL file and renders the
 //! user / assistant / tool-call / tool-result tree live as new lines arrive.
 
-mod app;
-mod parser;
-mod render;
-mod tree;
-
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use agent_graph_tui::{app, parser, render, tree};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
