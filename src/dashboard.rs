@@ -285,7 +285,7 @@ fn push_block(
     idx: usize,
     inner_w: usize,
 ) {
-    let marker = if idx == dash.selected { "▶ " } else { "  " };
+    let marker = if idx == dash.selected { "❯ " } else { "  " };
     let accent = agent_color(s.agent);
 
     let worktree = s
@@ -317,7 +317,7 @@ fn push_block(
         Span::styled(worktree, Style::default().fg(Color::White)),
         Span::raw("  "),
         Span::styled(
-            format!("⏵ {branch}"),
+            format!("→ {branch}"),
             Style::default().fg(accent),
         ),
         Span::raw("  "),

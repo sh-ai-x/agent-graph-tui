@@ -52,7 +52,7 @@ pub fn draw(f: &mut Frame, s: &Session, selected: usize, scroll: usize, path: &s
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("❯ ");
     f.render_stateful_widget(list, chunks[1], &mut state);
 
     let total = s.rows.len();
