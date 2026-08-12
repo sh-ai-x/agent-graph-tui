@@ -47,15 +47,33 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn build(parser: &crate::parser::Session) -> Self {
-        let mut s = Self {
+    pub fn new() -> Self {
+        Self {
             rows: Vec::new(),
             pending_tools: HashMap::new(),
-        };
-        for ev in &parser.events {
-            s.push(ev);
         }
+    }
+
+    pub fn build(parser: &crate::parser::Session) -> Self {
+        let mut s = Self::new();
+        s.extend_from(&parser.events);
         s
+    }
+
+    /// Append-only update: feed new events without rebuilding prior rows.
+    /// Caller passes only the slice that wasn't seen before; pending tool
+    /// resolution still uses `pending_tools` so old `tool_use` rows still
+    /// get their status updated.
+    pub fn extend_from(&mut self, events: &[Event]) {
+        for ev in events {
+            self.push(ev);
+        }
+    }
+
+    /// Reset state — used when the parser detects file rotation.
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.pending_tools.clear();
     }
 
     fn push(&mut self, ev: &Event) {
@@ -182,5 +200,35 @@ mod tests {
         // The result still appears as a row, just with no parent to update.
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.rows[0].depth, 1);
+    }
+
+    #[test]
+    fn extend_appends_only_to_existing_state() {
+        // Build from an initial event set; then extend with new events;
+        // verify rows now include both old + new without losing prior status.
+        let mut s = Session::build(&parser_with(vec![
+            ev_call("t1", "Read"),
+            ev_result("t1", false), // resolves to Done
+        ]));
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[0].status, Status::Done);
+
+        s.extend_from(&[ev_text("post-result prose")]);
+        assert_eq!(s.rows.len(), 3);
+        assert_eq!(s.rows[2].status, Status::Done);
+    }
+
+    #[test]
+    fn clear_resets_rows_and_pending_tools() {
+        let mut s = Session::build(&parser_with(vec![
+            ev_call("t1", "Read"),
+            ev_result("t1", false),
+        ]));
+        s.clear();
+        assert!(s.rows.is_empty());
+        // After clear, a fresh resolve should still work (HashMap reset).
+        s.extend_from(&[ev_call("t2", "Bash")]);
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.rows[0].status, Status::Pending);
     }
 }

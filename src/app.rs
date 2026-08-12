@@ -31,15 +31,28 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut session: ParseSession) -> std
 
     let path_str = session.path.display().to_string();
     let mut snap = tree::Session::build(&session);
+    // Cursor into `session.events` for incremental updates. Reset to 0 only
+    // when the parser reports `rebuilt` (rotation or ring-cap eviction), in
+    // which case we do a full rebuild via `tree::Session::build`.
+    let mut consumed: usize = session.events.len();
     let mut selected: usize = 0;
     let mut scroll: usize = 0;
 
     loop {
         if last_rescan.elapsed() >= Duration::from_millis(100) {
-            if let Ok(new_offset) = session.rescan_from(offset) {
-                if new_offset != offset {
-                    offset = new_offset;
-                    snap = tree::Session::build(&session);
+            if let Ok(outcome) = session.rescan_from(offset) {
+                if outcome.new_offset != offset {
+                    offset = outcome.new_offset;
+                    let cur_len = session.events.len();
+                    if outcome.rebuilt || cur_len < consumed {
+                        // Rotation or cap eviction: parser's event log diverged
+                        // from our incremental cursor. Rebuild from scratch.
+                        snap = tree::Session::build(&session);
+                    } else if cur_len > consumed {
+                        let delta = &session.events[consumed..cur_len];
+                        snap.extend_from(delta);
+                    }
+                    consumed = cur_len;
                 }
             }
             last_rescan = Instant::now();

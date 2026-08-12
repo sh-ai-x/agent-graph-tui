@@ -7,11 +7,23 @@
 //! handled in [`Session::rescan_from`].
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
+
+/// Hard cap on the number of `Event`s retained in memory. Once exceeded,
+/// the oldest entries are dropped (ring-buffer policy).
+#[cfg(not(test))]
+pub const MAX_EVENTS: usize = 50_000;
+#[cfg(test)]
+pub const MAX_EVENTS: usize = 16;
+
+/// Hard cap on how many bytes we will read from a single jsonl file.
+/// Caps a hostile / malformed / unterminated record so `read_until` can't
+/// allocate arbitrarily.
+const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -51,6 +63,14 @@ struct Raw {
     message: Value,
 }
 
+/// Outcome of a rescan, telling the caller whether the event log was reset
+/// (rotation or cap eviction) so it can rebuild its tree rather than doing
+/// an incremental extend that would target evicted rows.
+pub struct RescanOutcome {
+    pub new_offset: u64,
+    pub rebuilt: bool,
+}
+
 /// Read-only view of a session jsonl that can re-scan on demand.
 pub struct Session {
     pub path: PathBuf,
@@ -68,13 +88,14 @@ impl Session {
     }
 
     /// Re-read the file from `offset` bytes and append any newly parsed events.
-    /// Returns the new offset, or `0` if the file was rotated (size shrank below
-    /// the previous cursor).
-    pub fn rescan_from(&mut self, offset: u64) -> std::io::Result<u64> {
+    /// Caps the in-memory event log at `MAX_EVENTS` (ring policy) and totals
+    /// at `MAX_FILE_BYTES` (per-record allocation guard).
+    pub fn rescan_from(&mut self, offset: u64) -> std::io::Result<RescanOutcome> {
         let file_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         let seek_to = if file_size < offset { 0 } else { offset };
 
-        if seek_to != offset {
+        let rotated = seek_to != offset;
+        if rotated {
             // File was rotated/truncated: drop prior parse so a fresh start is
             // consistent with the truncated-and-rewritten contents.
             self.events.clear();
@@ -82,6 +103,7 @@ impl Session {
 
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(seek_to))?;
+        let f = f.take(MAX_FILE_BYTES);
         let mut reader = BufReader::new(f);
 
         let mut buf: Vec<u8> = Vec::new();
@@ -111,7 +133,18 @@ impl Session {
             self.events.extend(events);
         }
 
-        Ok(seek_to + consumed)
+        let cap_evicted = if self.events.len() > MAX_EVENTS {
+            let excess = self.events.len() - MAX_EVENTS;
+            self.events.drain(..excess);
+            true
+        } else {
+            false
+        };
+
+        Ok(RescanOutcome {
+            new_offset: seek_to + consumed,
+            rebuilt: rotated || cap_evicted,
+        })
     }
 }
 
@@ -325,10 +358,11 @@ mod tests {
             path: path.clone(),
             events: Vec::new(),
         };
-        let new_offset = s.rescan_from(0).unwrap();
+        let outcome = s.rescan_from(0).unwrap();
         assert_eq!(s.events.len(), 2);
+        assert!(!outcome.rebuilt, "fresh read should not flag rebuild");
         assert_eq!(
-            new_offset,
+            outcome.new_offset,
             body.len() as u64,
             "offset must match raw file size (CRLF = 2 bytes/line, not 1)"
         );
@@ -359,10 +393,43 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
 
         // Caller passes an offset that's past the post-rotation EOF; parser
-        // must detect the shrinkage and reset to byte 0, re-reading the file.
-        let new_offset = s.rescan_from(10_000).unwrap();
-        assert_eq!(new_offset, body.len() as u64, "rotation must re-read from byte 0");
+        // must detect the shrinkage, reset to byte 0, and signal rebuild.
+        let outcome = s.rescan_from(10_000).unwrap();
+        assert!(outcome.rebuilt, "rotation must signal rebuild");
+        assert_eq!(
+            outcome.new_offset,
+            body.len() as u64,
+            "rotation must re-read from byte 0"
+        );
         assert_eq!(s.events.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rescan_ring_caps_events_at_max_and_signals_rebuild() {
+        let path = std::env::temp_dir().join("agent-graph-tui-test-ring.jsonl");
+        let _ = std::fs::remove_file(&path);
+        // Write MAX_EVENTS + 5 lines.
+        let mut body = Vec::new();
+        for i in 0..(super::MAX_EVENTS + 5) {
+            let line = format!(
+                "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"msg {i}\"}},\"timestamp\":\"t{i}\"}}\n"
+            );
+            body.extend_from_slice(line.as_bytes());
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        // Build session at offset = body size minus the LAST 5 lines worth,
+        // so the next rescan only sees the additional 5 events but already
+        // had MAX_EVENTS in memory. To exercise cap eviction straightforwardly,
+        // start at offset 0 and let the parser consume all events at once.
+        let mut s = Session {
+            path: path.clone(),
+            events: Vec::new(),
+        };
+        let outcome = s.rescan_from(0).unwrap();
+        assert!(outcome.rebuilt, "ring-cap eviction from initial parse still flags rebuild");
+        assert_eq!(s.events.len(), super::MAX_EVENTS, "ring cap applied");
         let _ = std::fs::remove_file(&path);
     }
 }
