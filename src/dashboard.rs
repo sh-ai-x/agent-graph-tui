@@ -47,6 +47,11 @@ impl TailState {
     }
 }
 
+/// Threshold for the default "recent" filter. A session is "recent" if
+/// its JSONL was modified within the last `RECENT_MINUTES` minutes. The
+/// user can toggle this with `f` to see older history.
+pub const RECENT_MINUTES: u64 = 60;
+
 pub struct Dashboard {
     pub sessions: Vec<DiscoveredSession>,
     pub tails: HashMap<PathBuf, TailState>,
@@ -58,11 +63,11 @@ pub struct Dashboard {
     /// the execution graph rendered for each).
     pub nav_path: Vec<String>,
     pub last_discovery: Instant,
-    /// When false (default), sessions with status `Done` are hidden. Toggle
-    /// with `f`. Rationale: a finished session is no longer interesting
-    /// unless you're reviewing history; running/pending/failed/blocked all
-    /// deserve attention.
-    pub show_done: bool,
+    /// When true (default), only sessions modified within
+    /// `RECENT_MINUTES` are shown. Toggle with `f`. The Repos view
+    /// still shows every repo regardless of this filter — the filter
+    /// only hides individual sessions.
+    pub recent_only: bool,
     /// Path of the session whose execution graph is force-expanded. Most
     /// sessions now auto-show their graph; this is kept so `Enter` still
     /// means "force-expand this one" when the user wants the full tree.
@@ -106,7 +111,7 @@ impl Dashboard {
             selected: 0,
             nav_path: Vec::new(),
             last_discovery: Instant::now(),
-            show_done: false,
+            recent_only: true,
             expanded: None,
         };
         // Lazy: insert metadata-only entries; defer full parse to load_tail().
@@ -125,20 +130,34 @@ impl Dashboard {
             .or_insert_with(TailState::unloaded);
     }
 
-    /// Whether a session should be visible given the current `show_done`
-    /// filter. We use the lazy `quick_status` from discovery when the
-    /// tail hasn't been loaded yet, so freshly-discovered sessions are
-    /// filtered correctly without a full parse.
+    /// Whether a session should be visible given the current `recent_only`
+    /// filter. Sessions modified within `RECENT_MINUTES` are recent;
+    /// older sessions are hidden by default.
     pub fn session_visible(&self, s: &DiscoveredSession) -> bool {
-        if self.show_done {
+        if !self.recent_only {
             return true;
         }
-        let status = self
-            .tails
-            .get(&s.path)
-            .map(|t| t.status)
-            .unwrap_or(s.quick_status);
-        !matches!(status, tree::SessionStatus::Done)
+        match s.modified {
+            Some(m) => m
+                .elapsed()
+                .map(|d| d.as_secs() < RECENT_MINUTES * 60)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// All repos in the session list, sorted alphabetically. Used at the
+    /// top level so the user always sees the full repo list regardless
+    /// of the recency filter.
+    fn all_repos(&self) -> Vec<String> {
+        let mut repos: Vec<String> = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.repo_name.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+        repos
     }
     /// Open the parser and build the initial tree for a session; idempotent.
     pub fn load_tail(&mut self, path: &Path) -> bool {
@@ -360,9 +379,9 @@ impl Dashboard {
         }
     }
 
-    /// Toggle the show-done filter (`f` key).
-    pub fn toggle_show_done(&mut self) {
-        self.show_done = !self.show_done;
+    /// Toggle the recent-only filter (`f` key).
+    pub fn toggle_recent_only(&mut self) {
+        self.recent_only = !self.recent_only;
     }
 }
 
@@ -429,7 +448,7 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
         .selected_session()
         .map(|s| format!("{}/{} · {}", dash.selected + 1, dash.sessions.len(), s.agent.label()))
         .unwrap_or_else(|| "—".to_string());
-    let filter_label = if dash.show_done { "all" } else { "active only" };
+    let filter_label = if dash.recent_only { "all" } else { "active only" };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {selected_label} "),
@@ -450,7 +469,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut block_starts: Vec<usize> = Vec::new();
     let mut group_tops: Vec<usize> = Vec::new();
 
-    // Filter by `show_done`, by `nav_path` (repo / branch scope), then sort
+    // Filter by `recent_only`, by `nav_path` (repo / branch scope), then sort
     // by (repo, agent, branch, modified desc) so the user sees repos as
     // the outer group and branches within.
     let mut sorted: Vec<usize> = dash
@@ -827,7 +846,7 @@ mod tests {
             selected: 0,
             nav_path: Vec::new(),
             last_discovery: std::time::Instant::now(),
-            show_done: false,
+            recent_only: false,
             expanded: None,
         };
         let snapshot = sessions.clone();
@@ -904,7 +923,7 @@ mod tests {
         assert_eq!(compute_scroll(Some(101), Some(99), 100, 20), 80);
     }
 
-    // session_visible — show_done filter.
+    // session_visible — recent_only filter.
 
     fn sess_with_status(quick: crate::tree::SessionStatus) -> DiscoveredSession {
         DiscoveredSession {
@@ -924,27 +943,47 @@ mod tests {
     }
 
     #[test]
-    fn session_visible_default_hides_done() {
+    fn session_visible_recent_only_hides_old_modified_session() {
+        // recent_only=true (default) + old modified = hidden
         let mut d = Dashboard {
             sessions: vec![sess_with_status(crate::tree::SessionStatus::Done)],
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
-            show_done: false,
+            recent_only: true,
             nav_path: Vec::new(),
             expanded: None,
         };
+        // sess_with_status has modified=None → session_visible returns false
+        // (no mtime, can't prove recency).
         assert!(!d.session_visible(&d.sessions[0]));
     }
 
     #[test]
-    fn session_visible_show_done_includes_done() {
+    fn session_visible_recent_only_shows_recent_session() {
         let mut d = Dashboard {
             sessions: vec![sess_with_status(crate::tree::SessionStatus::Done)],
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
-            show_done: true,
+            recent_only: true,
+            nav_path: Vec::new(),
+            expanded: None,
+        };
+        // Patch the session's modified time to "now" so it's recent.
+        d.sessions[0].modified = Some(std::time::SystemTime::now());
+        assert!(d.session_visible(&d.sessions[0]));
+    }
+
+    #[test]
+    fn session_visible_recent_only_false_shows_everything() {
+        // recent_only=false → all sessions visible regardless of mtime
+        let mut d = Dashboard {
+            sessions: vec![sess_with_status(crate::tree::SessionStatus::Done)],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            recent_only: false,
             nav_path: Vec::new(),
             expanded: None,
         };
@@ -958,7 +997,7 @@ mod tests {
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
-            show_done: false,
+            recent_only: false,
             nav_path: Vec::new(),
             expanded: None,
         };
@@ -966,21 +1005,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_show_done_flips_filter() {
+    fn toggle_recent_only_flips_filter() {
         let mut d = Dashboard {
             sessions: vec![],
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
-            show_done: false,
+            recent_only: false,
             nav_path: Vec::new(),
             expanded: None,
         };
-        assert!(!d.show_done);
-        d.toggle_show_done();
-        assert!(d.show_done);
-        d.toggle_show_done();
-        assert!(!d.show_done);
+        assert!(!d.recent_only);
+        d.toggle_recent_only();
+        assert!(d.recent_only);
+        d.toggle_recent_only();
+        assert!(!d.recent_only);
     }
 
     #[test]
@@ -990,7 +1029,7 @@ mod tests {
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
-            show_done: false,
+            recent_only: false,
             nav_path: vec!["r".into(), "main".into()],
             expanded: None,
         };
@@ -1063,7 +1102,7 @@ fn handle_key(k: crossterm::event::KeyEvent, dash: &mut Dashboard) -> bool {
             false
         }
         KeyCode::Char('f') => {
-            dash.toggle_show_done();
+            dash.toggle_recent_only();
             false
         }
         KeyCode::Enter => {

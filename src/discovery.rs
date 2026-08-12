@@ -142,7 +142,11 @@ pub fn discover() -> DiscoveryReport {
     // `cwd` field first; falls back to the current working directory (the
     // directory the user invoked `agent-graph-tui` from) when the JSONL head
     // doesn't carry `cwd`. The encoded project path is never used as cwd.
+    //
+    // Skip sessions whose cwd resolves to the same repo we've already
+    // resolved — saves a git fork per worktree of the same project.
     let fallback_cwd = std::env::current_dir().ok();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &mut report.sessions {
         let cwd = s.cwd.clone().or_else(|| fallback_cwd.clone());
         let Some(cwd) = cwd else { continue };
@@ -153,10 +157,20 @@ pub fn discover() -> DiscoveryReport {
             s.branch = Some(b);
         }
         if let Some(root) = git_repo_root(&cwd) {
-            s.repo_name = root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .filter(|n| !n.is_empty());
+            let key = root.to_string_lossy().to_string();
+            if !seen.contains(&key) {
+                s.repo_name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty());
+                seen.insert(key);
+            } else {
+                // Same repo root already resolved; reuse the previous name.
+                s.repo_name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty());
+            }
         }
     }
 
@@ -431,14 +445,16 @@ fn model_from_value(v: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Walk up to 1 MiB of the file, line by line, looking for the first
-/// JSONL line that has a model field. The previous head-only scan missed
-/// large sessions whose first assistant message was past 64 KiB.
+/// Walk up to `MODEL_SCAN_BYTES` of the file, line by line, looking for
+/// the first JSONL line that has a model field. Most sessions put the
+/// model in the first 8-20 KiB; 64 KiB is a safe upper bound.
+const MODEL_SCAN_BYTES: u64 = 64 * 1024;
+
 fn extract_model(path: &Path) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    let read_up_to = len.min(1024 * 1024);
+    let read_up_to = len.min(MODEL_SCAN_BYTES);
     let mut buf = vec![0u8; read_up_to as usize];
     let _ = f.read(&mut buf).ok()?;
     let text = std::str::from_utf8(&buf).unwrap_or("");
