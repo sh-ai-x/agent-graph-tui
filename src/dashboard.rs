@@ -298,7 +298,23 @@ fn push_block(
         .map(|d| format_relative(d.as_secs()))
         .unwrap_or_else(|| "?".into());
 
-    // Header: agent icon + agent kind + model + branch + worktree + counts.
+    // Header: agent icon + agent kind + model + REPO NAME (from git) + branch.
+    // The repo name is `git -C <cwd> rev-parse --show-toplevel` → basename.
+    // Falls back to the worktree-name extraction (last segment of `--worktrees-X`),
+    // then to the session UUID prefix if nothing else resolves.
+    let label = s
+        .repo_name
+        .clone()
+        .or_else(|| s.worktree_name.clone())
+        .unwrap_or_else(|| {
+            let stem = s
+                .path
+                .file_stem()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            stem.get(..8).unwrap_or(stem.as_str()).to_string()
+        });
+
     lines.push(Line::from({
         let mut spans = vec![
             Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
@@ -319,12 +335,10 @@ fn push_block(
             ));
         }
         spans.push(Span::raw("  "));
-        if let Some(wt) = &s.worktree_name {
-            spans.push(Span::styled(
-                format!("{wt} "),
-                Style::default().fg(Color::White),
-            ));
-        }
+        spans.push(Span::styled(
+            format!("{label:<22} "),
+            Style::default().fg(Color::White),
+        ));
         spans.push(Span::styled(
             format!("⏵ {branch}"),
             Style::default().fg(accent),

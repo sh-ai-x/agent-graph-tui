@@ -104,16 +104,16 @@ fn run_dashboard(started: Instant) -> ExitCode {
         );
         for s in &dash.sessions {
             let label = s
-                .worktree_name
+                .repo_name
                 .clone()
+                .or_else(|| s.worktree_name.clone())
                 .unwrap_or_else(|| {
                     let stem = s
                         .path
                         .file_stem()
                         .map(|f| f.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    let short = stem.get(..8).unwrap_or(stem.as_str()).to_string();
-                    short
+                    stem.get(..8).unwrap_or(stem.as_str()).to_string()
                 });
             let model = s.model.clone().unwrap_or_else(|| "—".into());
             let _ = writeln!(

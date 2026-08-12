@@ -76,11 +76,16 @@ pub struct DiscoveredSession {
     /// (e.g. `claude-opus-4-8`, `MiniMax-M3`). The agent kind is the
     /// runner; this is the actual LLM.
     pub model: Option<String>,
+    /// Working directory the session was started from. Read from the
+    /// top-level `cwd` field of any JSONL line in the file.
+    pub cwd: Option<PathBuf>,
     /// Worktree name extracted from the project's `--worktrees-X` suffix,
     /// when applicable (Claude Code only).
     pub worktree_name: Option<String>,
-    /// `git -C <worktree> rev-parse --abbrev-ref HEAD`.
+    /// `git -C <cwd> rev-parse --abbrev-ref HEAD`.
     pub branch: Option<String>,
+    /// `git -C <cwd> rev-parse --show-toplevel` → basename.
+    pub repo_name: Option<String>,
     /// First user message, trimmed.
     pub task: Option<String>,
     pub size_bytes: u64,
@@ -128,14 +133,26 @@ pub fn discover() -> DiscoveryReport {
         .sort_by(|a, b| b.modified.cmp(&a.modified));
     report.sessions.truncate(MAX_SESSIONS);
 
-    // Phase 2: enrich the survivors with branch info (one git fork per session).
-    // We try the actual cwd via the `git -C <cwd> --git-dir` self-check rather
-    // than the encoded project path; the encoded path doesn't exist on disk.
+    // Phase 2: enrich the survivors with git-derived info (one git fork per
+    // session). Uses the cwd that's recorded in the JSONL's top-level
+    // `cwd` field first; falls back to the current working directory (the
+    // directory the user invoked `agent-graph-tui` from) when the JSONL head
+    // doesn't carry `cwd`. The encoded project path is never used as cwd.
+    let fallback_cwd = std::env::current_dir().ok();
     for s in &mut report.sessions {
-        if let Some(cwd) = guess_real_cwd(&s.path, &s.worktree_name) {
-            if cwd.exists() {
-                s.branch = git_branch(&cwd).filter(|b| !b.is_empty());
-            }
+        let cwd = s.cwd.clone().or_else(|| fallback_cwd.clone());
+        let Some(cwd) = cwd else { continue };
+        if !cwd.exists() {
+            continue;
+        }
+        if let Some(b) = git_branch(&cwd).filter(|b| !b.is_empty()) {
+            s.branch = Some(b);
+        }
+        if let Some(root) = git_toplevel(&cwd) {
+            s.repo_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty());
         }
     }
 
@@ -192,6 +209,7 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
 
     let agent = AgentKind::from_path(path);
     let model = extract_model(head_str);
+    let cwd = extract_cwd(head_str);
     let worktree_name = extract_worktree_name(path);
     let task = first_user_message(head_str);
 
@@ -201,8 +219,10 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
         path: path.to_path_buf(),
         agent,
         model,
+        cwd,
         worktree_name,
         branch: None,
+        repo_name: None,
         task,
         size_bytes: size,
         modified,
@@ -255,6 +275,23 @@ fn unescape(s: &str) -> String {
         .replace("\\t", " ")
         .trim()
         .to_string()
+}
+
+/// Pulls the cwd from the first JSONL line that has a top-level `cwd`
+/// field. Claude Code writes this on every line in the session file.
+fn extract_cwd(head: &str) -> Option<PathBuf> {
+    for line in head.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            if !cwd.is_empty() {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
 }
 
 /// Pulls the model name from the first assistant message in the head.
@@ -321,6 +358,24 @@ fn git_branch(cwd: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
 }
 
 #[cfg(test)]
