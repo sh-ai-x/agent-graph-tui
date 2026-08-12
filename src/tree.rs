@@ -303,4 +303,80 @@ mod tests {
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.rows[0].status, Status::Pending);
     }
+
+    // session_status — coarse-grained aggregation of per-row statuses.
+
+    fn row_with_status(status: Status, depth: usize) -> Node {
+        Node {
+            depth,
+            kind: NodeKind::AssistantText(String::new()),
+            status,
+            ts: String::new(),
+        }
+    }
+
+    #[test]
+    fn session_status_empty_rows_is_done() {
+        assert_eq!(session_status(&[], None), SessionStatus::Done);
+    }
+
+    #[test]
+    fn session_status_all_done_is_done() {
+        let rows = vec![
+            row_with_status(Status::Done, 0),
+            row_with_status(Status::Done, 0),
+        ];
+        assert_eq!(session_status(&rows, None), SessionStatus::Done);
+    }
+
+    #[test]
+    fn session_status_one_pending_is_running() {
+        let rows = vec![
+            row_with_status(Status::Done, 0),
+            row_with_status(Status::Pending, 0),
+        ];
+        assert_eq!(session_status(&rows, None), SessionStatus::Running);
+    }
+
+    #[test]
+    fn session_status_failed_takes_precedence_over_pending() {
+        let rows = vec![
+            row_with_status(Status::Pending, 0),
+            row_with_status(Status::Failed, 0),
+        ];
+        assert_eq!(session_status(&rows, None), SessionStatus::Failed);
+    }
+
+    #[test]
+    fn session_status_pending_with_old_mtime_is_blocked() {
+        let rows = vec![row_with_status(Status::Pending, 0)];
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(BLOCKED_AFTER.as_secs() + 60);
+        assert_eq!(session_status(&rows, Some(old)), SessionStatus::Blocked);
+    }
+
+    #[test]
+    fn session_status_pending_with_recent_mtime_is_running() {
+        let rows = vec![row_with_status(Status::Pending, 0)];
+        let recent = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(5);
+        assert_eq!(session_status(&rows, Some(recent)), SessionStatus::Running);
+    }
+
+    #[test]
+    fn session_status_no_pending_with_failed_is_failed() {
+        let rows = vec![
+            row_with_status(Status::Done, 0),
+            row_with_status(Status::Failed, 0),
+        ];
+        assert_eq!(session_status(&rows, None), SessionStatus::Failed);
+    }
+
+    #[test]
+    fn session_status_glyphs_have_distinct_chars() {
+        assert_eq!(SessionStatus::Running.glyph(), "*");
+        assert_eq!(SessionStatus::Done.glyph(), "o");
+        assert_eq!(SessionStatus::Failed.glyph(), "x");
+        assert_eq!(SessionStatus::Blocked.glyph(), "?");
+    }
 }

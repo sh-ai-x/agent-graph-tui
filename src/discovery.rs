@@ -356,6 +356,10 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
                     return tree::SessionStatus::Running;
                 }
             }
+        } else if content.and_then(|c| c.as_str()).is_some() {
+            // Plain text user message — the user is actively typing,
+            // so the agent is presumed to be running.
+            return tree::SessionStatus::Running;
         }
         return tree::SessionStatus::Done;
     }
@@ -511,7 +515,7 @@ mod tests {
         assert!(name.is_none());
     }
 
-    #[test]
+      #[test]
     fn extract_model_picks_up_first_assistant_model_field() {
         let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
                     {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
@@ -524,5 +528,102 @@ mod tests {
         let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
         let model = extract_model(head);
         assert!(model.is_none());
+    }
+
+    // quick_status — exercises the last-event probe used by the text-mode
+    // fallback so the dashboard status column matches what the TUI's tail
+    // recompute would produce.
+
+    fn write_temp_jsonl(name: &str, content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agent-graph-tui-test-{}-{}.jsonl",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_file(&path); // ensure no leftover from previous run
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn quick_status_assistant_text_is_done() {
+        let path = write_temp_jsonl(
+            "assistant_text",
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+"#,
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Done);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_assistant_tool_use_is_running() {
+        let path = write_temp_jsonl(
+            "assistant_tool_use",
+            r#"{"type":"user","message":{"role":"user","content":"read x"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
+"#,
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_user_text_is_running() {
+        let path = write_temp_jsonl(
+            "user_text",
+            r#"{"type":"user","message":{"role":"user","content":"continue"}}
+"#,
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_user_tool_result_is_error_is_failed() {
+        let path = write_temp_jsonl(
+            "user_tool_result_error",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"err","is_error":true}]}}
+"#,
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Failed);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_empty_file_is_done() {
+        let path = write_temp_jsonl("empty", "");
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Done);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_garbage_file_is_done() {
+        let path = write_temp_jsonl("garbage", "not even json");
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Done);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_uses_last_non_empty_line_at_file_end() {
+        let mut buf = String::new();
+        for _ in 0..64 {
+            buf.push_str(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#);
+            buf.push('\n');
+        }
+        buf.push_str(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#);
+        buf.push('\n');
+        let path = write_temp_jsonl("buf_end", &buf);
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
     }
 }
