@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::discovery::{AgentKind, DiscoveryReport, DiscoveredSession};
-use crate::tree::{Node, NodeKind, Status};
+use crate::tree::{Node, NodeKind, SessionStatus, Status, session_status};
 use crate::{parser, tree};
 
 const MAX_SESSIONS: usize = 32;
@@ -29,6 +29,7 @@ pub struct TailState {
     pub last_rescan: Instant,
     pub last_error: Option<String>,
     pub loaded: bool,
+    pub status: SessionStatus,
 }
 
 impl TailState {
@@ -41,6 +42,7 @@ impl TailState {
             last_rescan: Instant::now(),
             last_error: None,
             loaded: false,
+            status: SessionStatus::Done,
         }
     }
 }
@@ -53,6 +55,26 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
+    /// Build a `TailState` from a freshly-loaded parser session. Computes the
+    /// initial session-level status from the rows.
+    fn fresh_tail_at(p: parser::Session) -> TailState {
+        let consumed = p.events.len();
+        let offset = std::fs::metadata(&p.path).map(|m| m.len()).unwrap_or(0);
+        let tree = tree::Session::build(&p);
+        let modified = std::fs::metadata(&p.path).ok().and_then(|m| m.modified().ok());
+        let status = session_status(&tree.rows, modified);
+        TailState {
+            parser: Some(p),
+            tree,
+            consumed,
+            offset,
+            last_rescan: Instant::now(),
+            last_error: None,
+            loaded: true,
+            status,
+        }
+    }
+
     pub fn from_report(report: DiscoveryReport) -> Self {
         let sessions: Vec<_> = report.sessions.into_iter().take(MAX_SESSIONS).collect();
         let mut dash = Self {
@@ -75,7 +97,7 @@ impl Dashboard {
         self.tails
             .entry(s.path.clone())
             .or_insert_with(TailState::unloaded);
-    }
+}
 
     /// Open the parser and build the initial tree for a session; idempotent.
     pub fn load_tail(&mut self, path: &Path) -> bool {
@@ -89,16 +111,9 @@ impl Dashboard {
         }
         match parser::Session::open(path) {
             Ok(p) => {
-                let offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                let consumed = p.events.len();
-                let built = tree::Session::build(&p);
+                let new_tail = Self::fresh_tail_at(p);
                 if let Some(tail) = self.tails.get_mut(path) {
-                    tail.parser = Some(p);
-                    tail.tree = built;
-                    tail.consumed = consumed;
-                    tail.offset = offset;
-                    tail.loaded = true;
-                    tail.last_error = None;
+                    *tail = new_tail;
                 }
                 true
             }
@@ -168,7 +183,9 @@ impl Dashboard {
                 }
             }
             tail.last_rescan = Instant::now();
-            let _ = path; // silence unused warning when not consumed
+            // Recompute session-level status from the latest tree rows.
+            let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            tail.status = session_status(&tail.tree.rows, modified);
         }
     }
 
@@ -271,24 +288,136 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
 fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut block_starts: Vec<usize> = Vec::new();
-    for (idx, session) in dash.sessions.iter().enumerate() {
+
+    // Sort sessions by (agent, repo, branch, modified desc) for grouping.
+    let mut sorted: Vec<usize> = (0..dash.sessions.len()).collect();
+    sorted.sort_by(|&a, &b| {
+        let sa = &dash.sessions[a];
+        let sb = &dash.sessions[b];
+        let key_a = (agent_sort_key(sa.agent), sa.repo_name.clone().unwrap_or_default(), sa.branch.clone().unwrap_or_default());
+        let key_b = (agent_sort_key(sb.agent), sb.repo_name.clone().unwrap_or_default(), sb.branch.clone().unwrap_or_default());
+        key_a
+            .0
+            .cmp(&key_b.0)
+            .then(key_a.1.cmp(&key_b.1))
+            .then(key_a.2.cmp(&key_b.2))
+            .then(sb.modified.cmp(&sa.modified))
+    });
+
+    let mut last_agent: Option<AgentKind> = None;
+    let mut last_repo: Option<String> = None;
+    let mut last_branch: Option<String> = None;
+
+    for &idx in &sorted {
+        let s = &dash.sessions[idx];
+
+        // Agent header — emit when agent kind changes.
+        if last_agent != Some(s.agent) {
+            let accent = agent_color(s.agent);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", s.agent.icon()),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    s.agent.label().to_string(),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({} sessions)", count_for_agent(dash, s.agent)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            last_agent = Some(s.agent);
+            last_repo = None;
+            last_branch = None;
+        }
+
+        // Repo header — emit when repo changes within the same agent.
+        let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+        if last_repo.as_deref() != Some(repo_disp.as_str()) {
+            let accent = agent_color(s.agent);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<22}", repo_disp),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({})", count_for_repo(dash, s.agent, &repo_disp)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            last_repo = Some(repo_disp.clone());
+            last_branch = None;
+        }
+
+        // Branch sub-group — emit when branch changes within the same repo.
+        let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
+        if last_branch.as_deref() != Some(branch_disp.as_str()) {
+            let accent = agent_color(s.agent);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("⏵ {branch_disp}"),
+                    Style::default().fg(accent),
+                ),
+                Span::styled(
+                    format!(
+                        "  ({})",
+                        count_for_branch(dash, s.agent, repo_disp.as_str(), branch_disp.as_str())
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            last_branch = Some(branch_disp);
+        }
+
+        let accent = agent_color(s.agent);
         block_starts.push(lines.len());
-        push_block(&mut lines, dash, session, idx, inner_w);
+        push_session(&mut lines, dash, s, idx, inner_w, accent);
     }
     (lines, block_starts)
 }
 
-fn push_block(
+fn agent_sort_key(k: AgentKind) -> u8 {
+    match k {
+        AgentKind::ClaudeCode => 0,
+        AgentKind::Codex => 1,
+        AgentKind::MiniMax => 2,
+        AgentKind::Gemini => 3,
+        AgentKind::Unknown => 4,
+    }
+}
+
+fn count_for_agent(dash: &Dashboard, agent: AgentKind) -> usize {
+    dash.sessions.iter().filter(|s| s.agent == agent).count()
+}
+
+fn count_for_repo(dash: &Dashboard, agent: AgentKind, repo: &str) -> usize {
+    dash.sessions.iter().filter(|s| s.agent == agent && s.repo_name.as_deref() == Some(repo)).count()
+}
+
+fn count_for_branch(dash: &Dashboard, agent: AgentKind, repo: &str, branch: &str) -> usize {
+    dash.sessions
+        .iter()
+        .filter(|s| s.agent == agent && s.repo_name.as_deref() == Some(repo) && s.branch.as_deref() == Some(branch))
+        .count()
+}
+
+fn push_session(
     lines: &mut Vec<Line<'static>>,
     dash: &Dashboard,
     s: &DiscoveredSession,
     idx: usize,
     inner_w: usize,
+    accent: Color,
 ) {
     let marker = if idx == dash.selected { "▶ " } else { "  " };
-    let accent = agent_color(s.agent);
+    let status = dash.tails.get(&s.path).map(|t| t.status).unwrap_or(crate::tree::SessionStatus::Done);
+    let status_color = status.color();
 
-    let branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
+    let _branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
     let task = s.task.clone().unwrap_or_default();
     let task_trim = truncate(&task, inner_w.saturating_sub(20));
     let node_count = s.node_count_proxy;
@@ -298,54 +427,28 @@ fn push_block(
         .map(|d| format_relative(d.as_secs()))
         .unwrap_or_else(|| "?".into());
 
-    // Header: agent icon + agent kind + model + REPO NAME (from git) + branch.
-    // The repo name is `git -C <cwd> rev-parse --show-toplevel` → basename.
-    // Falls back to the worktree-name extraction (last segment of `--worktrees-X`),
-    // then to the session UUID prefix if nothing else resolves.
-    let label = s
-        .repo_name
-        .clone()
-        .or_else(|| s.worktree_name.clone())
-        .unwrap_or_else(|| {
-            let stem = s
-                .path
-                .file_stem()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default();
-            stem.get(..8).unwrap_or(stem.as_str()).to_string()
-        });
-
     lines.push(Line::from({
         let mut spans = vec![
+            Span::raw("      "),
+            Span::styled(
+                format!("[{}] ", status.glyph()),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("{} ", s.agent.icon()),
-                Style::default().fg(accent),
-            ),
-            Span::styled(
-                format!("{:<11}", s.agent.label()),
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
         ];
         if let Some(model) = &s.model {
-            spans.push(Span::raw(" "));
             spans.push(Span::styled(
-                model_short(model),
-                Style::default().fg(Color::Gray),
+                format!("{:<14} ", model_short(model)),
+                Style::default().fg(Color::Magenta),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("{:<14} ", "<unknown>"),
+                Style::default().fg(Color::DarkGray),
             ));
         }
-        spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("{label:<22} "),
-            Style::default().fg(Color::White),
-        ));
-        spans.push(Span::styled(
-            format!("⏵ {branch}"),
-            Style::default().fg(accent),
-        ));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("{node_count} nodes"),
+            format!("{node_count:>3} nodes"),
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::raw("  "));
@@ -355,36 +458,30 @@ fn push_block(
 
     if !task_trim.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  └ task: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("        task: ", Style::default().fg(Color::DarkGray)),
             Span::styled(task_trim, Style::default().fg(Color::Gray)),
         ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "  └ task: <empty>",
-            Style::default().fg(Color::DarkGray),
-        )));
     }
 
     if idx == dash.selected {
         lines.push(Line::from(Span::styled(
-            "  ── execution graph ──",
+            "        ── execution graph ──",
             Style::default().fg(accent),
         )));
         if let Some(tail) = dash.tails.get(&s.path) {
             if let Some(err) = &tail.last_error {
                 lines.push(Line::from(vec![
-                    Span::styled("    ⚠ ", Style::default().fg(Color::Red)),
+                    Span::styled("          ⚠ ", Style::default().fg(Color::Red)),
                     Span::styled(err.clone(), Style::default().fg(Color::Red)),
                 ]));
             }
-            // Last 12 rows, newest first.
-            let recent: Vec<&Node> = tail.tree.rows.iter().rev().take(12).collect();
+            let recent: Vec<&Node> = tail.tree.rows.iter().rev().take(8).collect();
             for n in recent.iter().rev() {
                 lines.push(render_dashboard_row(n, accent));
             }
         } else {
             lines.push(Line::from(Span::styled(
-                "    (no tail state yet)",
+                "        (no tail state yet)",
                 Style::default().fg(Color::DarkGray),
             )));
         }

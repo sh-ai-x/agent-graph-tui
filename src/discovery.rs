@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+use crate::tree;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     ClaudeCode,
@@ -86,6 +88,8 @@ pub struct DiscoveredSession {
     pub branch: Option<String>,
     /// `git -C <cwd> rev-parse --show-toplevel` → basename.
     pub repo_name: Option<String>,
+    /// Quick status from the file's last event (no full parse).
+    pub quick_status: tree::SessionStatus,
     /// First user message, trimmed.
     pub task: Option<String>,
     pub size_bytes: u64,
@@ -203,9 +207,12 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
 
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
-    let mut head = [0u8; 8 * 1024];
+    // Read up to 64 KiB so we likely cover the first assistant message (model
+    // field) AND the first user message (cwd field). 8 KiB was too small.
+    let mut head = vec![0u8; 64 * 1024];
     let n = f.read(&mut head).unwrap_or(0);
-    let head_str = std::str::from_utf8(&head[..n]).unwrap_or("");
+    head.truncate(n);
+    let head_str = std::str::from_utf8(&head).unwrap_or("");
 
     let agent = AgentKind::from_path(path);
     let model = extract_model(head_str);
@@ -223,6 +230,7 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
         worktree_name,
         branch: None,
         repo_name: None,
+        quick_status: quick_status(path),
         task,
         size_bytes: size,
         modified,
@@ -292,6 +300,66 @@ fn extract_cwd(head: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Quick session-status check by reading the FILE'S LAST event from the tail
+/// of the JSONL. Avoids parsing the entire file. Returns:
+///   - `Running` if the last event is a `tool_use` (no matching result yet).
+///   - `Failed` if the last event is a `tool_result` with `is_error=true`.
+///   - `Done`   otherwise (last event is a user message → either Blocked-on-user
+///               or fully done; we don't distinguish here).
+pub fn quick_status(path: &Path) -> tree::SessionStatus {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return tree::SessionStatus::Done;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return tree::SessionStatus::Done;
+    }
+    // Read the last 8 KiB; drop the partial last line.
+    let seek_to = len.saturating_sub(8 * 1024);
+    let _ = f.seek(SeekFrom::Start(seek_to));
+    let mut buf = Vec::with_capacity((len - seek_to) as usize);
+    let _ = f.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let last_line = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let v: serde_json::Value = match serde_json::from_str(last_line) {
+        Ok(v) => v,
+        Err(_) => return tree::SessionStatus::Done,
+    };
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if ty == "assistant" {
+        // Has any tool_use without matching tool_result in the buffered tail?
+        let content = v.get("message").and_then(|m| m.get("content"));
+        if let Some(arr) = content.and_then(|c| c.as_array()) {
+            for block in arr {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    return tree::SessionStatus::Running;
+                }
+            }
+        }
+        return tree::SessionStatus::Done;
+    }
+    if ty == "user" {
+        let content = v.get("message").and_then(|m| m.get("content"));
+        if let Some(arr) = content.and_then(|c| c.as_array()) {
+            for block in arr {
+                if block.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+                    return tree::SessionStatus::Failed;
+                }
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    return tree::SessionStatus::Running;
+                }
+            }
+        }
+        return tree::SessionStatus::Done;
+    }
+    tree::SessionStatus::Done
 }
 
 /// Pulls the model name from the first assistant message in the head.

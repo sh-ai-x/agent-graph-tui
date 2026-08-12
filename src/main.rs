@@ -102,34 +102,60 @@ fn run_dashboard(started: Instant) -> ExitCode {
             dash.sessions.len(),
             cold_start_ms
         );
-        for s in &dash.sessions {
-            let label = s
-                .repo_name
-                .clone()
-                .or_else(|| s.worktree_name.clone())
-                .unwrap_or_else(|| {
-                    let stem = s
-                        .path
-                        .file_stem()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    stem.get(..8).unwrap_or(stem.as_str()).to_string()
-                });
-            let model = s.model.clone().unwrap_or_else(|| "—".into());
+        // Re-render with the same hierarchy as the TUI: agent → repo → branch.
+        let mut sorted: Vec<usize> = (0..dash.sessions.len()).collect();
+        sorted.sort_by(|&a, &b| {
+            let sa = &dash.sessions[a];
+            let sb = &dash.sessions[b];
+            (
+                sa.agent as u8,
+                sa.repo_name.clone().unwrap_or_default(),
+                sa.branch.clone().unwrap_or_default(),
+            )
+                .cmp(&(
+                    sb.agent as u8,
+                    sb.repo_name.clone().unwrap_or_default(),
+                    sb.branch.clone().unwrap_or_default(),
+                ))
+        });
+        let mut last_agent: Option<agent_graph_tui::discovery::AgentKind> = None;
+        let mut last_repo: Option<String> = None;
+        let mut last_branch: Option<String> = None;
+        for &idx in &sorted {
+            let s = &dash.sessions[idx];
+            if last_agent != Some(s.agent) {
+                let _ = writeln!(
+                    lock,
+                    "\n{} {} ({} sessions)",
+                    s.agent.icon(),
+                    s.agent.label(),
+                    dash.sessions.iter().filter(|x| x.agent == s.agent).count()
+                );
+                last_agent = Some(s.agent);
+                last_repo = None;
+                last_branch = None;
+            }
+            let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+            if last_repo.as_deref() != Some(repo_disp.as_str()) {
+                let _ = writeln!(lock, "  {repo_disp}");
+                last_repo = Some(repo_disp);
+                last_branch = None;
+            }
+            let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
+            if last_branch.as_deref() != Some(branch_disp.as_str()) {
+                let _ = writeln!(lock, "    ⏵ {branch_disp}");
+                last_branch = Some(branch_disp);
+            }
+            let status = dash.tails.get(&s.path).map(|t| t.status).unwrap_or(s.quick_status);
+            let model = s.model.clone().unwrap_or_else(|| "<unknown>".into());
             let _ = writeln!(
                 lock,
-                "\n{} {} {} ⏵ {}",
-                s.agent.icon(),
-                s.agent.label(),
-                label,
-                s.branch.clone().unwrap_or_else(|| "—".into())
+                "      [{}] {model:<22} {:>3} nodes",
+                status.glyph(),
+                s.node_count_proxy
             );
-            let _ = writeln!(lock, "  model: {model}");
             if let Some(t) = &s.task {
-                let _ = writeln!(lock, "  task:  {t}");
-            }
-            if let Some(err) = dash.tails.get(&s.path).and_then(|t| t.last_error.as_ref()) {
-                let _ = writeln!(lock, "  ⚠ {err}");
+                let _ = writeln!(lock, "        task: {t}");
             }
         }
         return ExitCode::SUCCESS;

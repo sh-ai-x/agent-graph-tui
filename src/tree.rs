@@ -12,6 +12,8 @@
 
 use std::collections::HashMap;
 
+use ratatui::style::Color;
+
 use crate::parser::Event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +21,76 @@ pub enum Status {
     Pending,
     Done,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// Some `tool_use` is awaiting a result. The agent is mid-task.
+    Running,
+    /// All `tool_use`s resolved cleanly — agent reached an end state.
+    Done,
+    /// At least one `tool_result` came back with `is_error=true`.
+    Failed,
+    /// Has pending work AND no file activity for ≥ BLOCKED_AFTER. The agent
+    /// is probably waiting on user input or stalled.
+    Blocked,
+}
+
+pub const BLOCKED_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+impl SessionStatus {
+    /// Single-character glyph for the dashboard header. ASCII only so
+    /// narrow TUI fonts don't break alignment.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => "*",
+            Self::Done => "o",
+            Self::Failed => "x",
+            Self::Blocked => "?",
+        }
+    }
+
+    /// CSS-style color hint for the glyph.
+    pub fn color(self) -> Color {
+        match self {
+            Self::Running => Color::Green,
+            Self::Done => Color::DarkGray,
+            Self::Failed => Color::Red,
+            Self::Blocked => Color::Yellow,
+        }
+    }
+}
+
+/// Compute the session-level status from the rows. Caller passes the
+/// last-modified timestamp of the underlying file so we can flip
+/// Running → Blocked when a session stalls.
+pub fn session_status(
+    rows: &[Node],
+    last_modified: Option<std::time::SystemTime>,
+) -> SessionStatus {
+    let mut has_failed = false;
+    let mut has_pending = false;
+    for row in rows {
+        match row.status {
+            Status::Pending => has_pending = true,
+            Status::Failed => has_failed = true,
+            Status::Done => {}
+        }
+    }
+    if has_failed {
+        return SessionStatus::Failed;
+    }
+    if has_pending {
+        if let Some(modified) = last_modified {
+            if let Ok(elapsed) = modified.elapsed() {
+                if elapsed >= BLOCKED_AFTER {
+                    return SessionStatus::Blocked;
+                }
+            }
+        }
+        return SessionStatus::Running;
+    }
+    SessionStatus::Done
 }
 
 #[derive(Debug, Clone)]
