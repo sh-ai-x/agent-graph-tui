@@ -39,13 +39,14 @@ pub enum SessionStatus {
 pub const BLOCKED_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 impl SessionStatus {
-    /// Single-character glyph for the dashboard header. ASCII only so
-    /// narrow TUI fonts don't break alignment.
+    /// Filled/empty dot glyph for the dashboard. Filled = active work
+    /// in flight, empty = nothing pending. `x` for failed (rendered with
+    /// `Color::Red` so the user can tell apart from `o` done).
     pub fn glyph(self) -> &'static str {
         match self {
-            Self::Running => "*",
-            Self::Done => "o",
-            Self::Failed => "x",
+            Self::Running => "●",
+            Self::Done => "○",
+            Self::Failed => "✗",
             Self::Blocked => "?",
         }
     }
@@ -373,10 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn session_status_glyphs_have_distinct_chars() {
-        assert_eq!(SessionStatus::Running.glyph(), "*");
-        assert_eq!(SessionStatus::Done.glyph(), "o");
-        assert_eq!(SessionStatus::Failed.glyph(), "x");
+    fn session_status_glyphs_are_filled_or_empty_dot() {
+        assert_eq!(SessionStatus::Running.glyph(), "●");
+        assert_eq!(SessionStatus::Done.glyph(), "○");
+        assert_eq!(SessionStatus::Failed.glyph(), "✗");
         assert_eq!(SessionStatus::Blocked.glyph(), "?");
     }
 }

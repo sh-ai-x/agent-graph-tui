@@ -52,6 +52,14 @@ pub struct Dashboard {
     pub tails: HashMap<PathBuf, TailState>,
     pub selected: usize,
     pub last_discovery: Instant,
+    /// When false (default), sessions with status `Done` are hidden. Toggle
+    /// with `f`. Rationale: a finished session is no longer interesting
+    /// unless you're reviewing history; running/pending/failed/blocked all
+    /// deserve attention.
+    pub show_done: bool,
+    /// Path of the session whose execution graph is expanded. `None` means
+    /// no session is expanded — `Enter` toggles.
+    pub expanded: Option<PathBuf>,
 }
 
 impl Dashboard {
@@ -82,12 +90,14 @@ impl Dashboard {
             tails: HashMap::new(),
             selected: 0,
             last_discovery: Instant::now(),
+            show_done: false,
+            expanded: None,
         };
         // Lazy: insert metadata-only entries; defer full parse to load_tail().
         for s in &sessions {
             dash.tails
                 .entry(s.path.clone())
-                .or_insert_with(|| TailState::unloaded());
+                .or_insert_with(TailState::unloaded);
         }
         dash.sessions = sessions;
         dash
@@ -97,8 +107,23 @@ impl Dashboard {
         self.tails
             .entry(s.path.clone())
             .or_insert_with(TailState::unloaded);
-}
+    }
 
+    /// Whether a session should be visible given the current `show_done`
+    /// filter. We use the lazy `quick_status` from discovery when the
+    /// tail hasn't been loaded yet, so freshly-discovered sessions are
+    /// filtered correctly without a full parse.
+    pub fn session_visible(&self, s: &DiscoveredSession) -> bool {
+        if self.show_done {
+            return true;
+        }
+        let status = self
+            .tails
+            .get(&s.path)
+            .map(|t| t.status)
+            .unwrap_or(s.quick_status);
+        !matches!(status, tree::SessionStatus::Done)
+    }
     /// Open the parser and build the initial tree for a session; idempotent.
     pub fn load_tail(&mut self, path: &Path) -> bool {
         let needs_load = self
@@ -213,6 +238,23 @@ impl Dashboard {
         // Auto-load on focus so the execution graph renders without manual action.
         self.ensure_loaded(self.selected);
     }
+
+    /// Toggle expansion of the selected session (Enter key).
+    pub fn toggle_expand(&mut self) {
+        if let Some(s) = self.sessions.get(self.selected) {
+            if self.expanded.as_ref() == Some(&s.path) {
+                self.expanded = None;
+            } else {
+                self.expanded = Some(s.path.clone());
+                self.ensure_loaded(self.selected);
+            }
+        }
+    }
+
+    /// Toggle the show-done filter (`f` key).
+    pub fn toggle_show_done(&mut self) {
+        self.show_done = !self.show_done;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -243,7 +285,7 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
         ),
         Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            "↑/↓ select   ⏎ expand   q quit",
+            "↑/↓ select   ⏎ expand   f filter   q quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]))
@@ -273,13 +315,16 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
         .selected_session()
         .map(|s| format!("{}/{} · {}", dash.selected + 1, dash.sessions.len(), s.agent.label()))
         .unwrap_or_else(|| "—".to_string());
+    let filter_label = if dash.show_done { "all" } else { "active only" };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {selected_label} "),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "live tailing · refresh 5 s · events ring 50 k",
+            format!(
+                "  ⏎ expand · f filter ({filter_label}) · r refresh · q quit"
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -291,13 +336,28 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut block_starts: Vec<usize> = Vec::new();
     let mut group_tops: Vec<usize> = Vec::new();
 
-    // Sort sessions by (agent, repo, branch, modified desc) for grouping.
-    let mut sorted: Vec<usize> = (0..dash.sessions.len()).collect();
+    // Filter by `show_done`, then sort by (repo, agent, branch, modified desc)
+    // so the user sees repos as the outer group and branches within.
+    let mut sorted: Vec<usize> = dash
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| dash.session_visible(s))
+        .map(|(i, _)| i)
+        .collect();
     sorted.sort_by(|&a, &b| {
         let sa = &dash.sessions[a];
         let sb = &dash.sessions[b];
-        let key_a = (agent_sort_key(sa.agent), sa.repo_name.clone().unwrap_or_default(), sa.branch.clone().unwrap_or_default());
-        let key_b = (agent_sort_key(sb.agent), sb.repo_name.clone().unwrap_or_default(), sb.branch.clone().unwrap_or_default());
+        let key_a = (
+            sa.repo_name.clone().unwrap_or_default(),
+            agent_sort_key(sa.agent),
+            sa.branch.clone().unwrap_or_default(),
+        );
+        let key_b = (
+            sb.repo_name.clone().unwrap_or_default(),
+            agent_sort_key(sb.agent),
+            sb.branch.clone().unwrap_or_default(),
+        );
         key_a
             .0
             .cmp(&key_b.0)
@@ -306,19 +366,57 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
             .then(sb.modified.cmp(&sa.modified))
     });
 
-    let mut last_agent: Option<AgentKind> = None;
     let mut last_repo: Option<String> = None;
+    let mut last_agent: Option<AgentKind> = None;
     let mut last_branch: Option<String> = None;
     let mut current_group_top: usize = 0;
+    // Track which repos have multiple agents so we only show the agent
+    // sub-group when it's actually disambiguating.
+    let mut repo_agents: std::collections::HashMap<String, std::collections::HashSet<u8>> =
+        std::collections::HashMap::new();
+    for &i in &sorted {
+        let s = &dash.sessions[i];
+        let k = s.repo_name.clone().unwrap_or_default();
+        repo_agents.entry(k).or_default().insert(agent_sort_key(s.agent));
+    }
 
     for &idx in &sorted {
         let s = &dash.sessions[idx];
 
-        // Agent header — emit when agent kind changes.
-        if last_agent != Some(s.agent) {
-            let accent = agent_color(s.agent);
+        // Repo header — emit on change. Always shown, since this is the
+        // top-level navigation unit.
+        let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+        if last_repo.as_deref() != Some(repo_disp.as_str()) {
+            let total_in_repo = repo_agents
+                .get(&repo_disp)
+                .map(|_| count_for_repo_unfiltered(dash, &repo_disp))
+                .unwrap_or(0);
             current_group_top = lines.len();
             lines.push(Line::from(vec![
+                Span::raw("📁 "),
+                Span::styled(
+                    format!("{:<22}", repo_disp),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({} sessions)", total_in_repo),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            last_repo = Some(repo_disp.clone());
+            last_agent = None;
+            last_branch = None;
+        }
+
+        // Agent sub-header — only when this repo has 2+ distinct agents.
+        let show_agent = repo_agents
+            .get(&repo_disp)
+            .map(|agents| agents.len() > 1)
+            .unwrap_or(false);
+        if show_agent && last_agent != Some(s.agent) {
+            let accent = agent_color(s.agent);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
                 Span::styled(
                     format!("{} ", s.agent.icon()),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
@@ -327,50 +425,22 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                     s.agent.label().to_string(),
                     Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  ({} sessions)", count_for_agent(dash, s.agent)),
-                    Style::default().fg(Color::DarkGray),
-                ),
             ]));
             last_agent = Some(s.agent);
-            last_repo = None;
             last_branch = None;
+        } else {
+            last_agent = Some(s.agent);
         }
 
-        // Repo header — emit when repo changes within the same agent.
-        let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
-        if last_repo.as_deref() != Some(repo_disp.as_str()) {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<22}", repo_disp),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  ({})", count_for_repo(dash, s.agent, &repo_disp)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            last_repo = Some(repo_disp.clone());
-            last_branch = None;
-        }
-
-        // Branch sub-group — emit when branch changes within the same repo.
+        // Branch sub-group — always shown.
         let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
         if last_branch.as_deref() != Some(branch_disp.as_str()) {
-            let accent = agent_color(s.agent);
+            let accent = if show_agent { agent_color(s.agent) } else { Color::White };
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::raw(if show_agent { "    " } else { "  " }),
                 Span::styled(
                     format!("⏵ {branch_disp}"),
                     Style::default().fg(accent),
-                ),
-                Span::styled(
-                    format!(
-                        "  ({})",
-                        count_for_branch(dash, s.agent, repo_disp.as_str(), branch_disp.as_str())
-                    ),
-                    Style::default().fg(Color::DarkGray),
                 ),
             ]));
             last_branch = Some(branch_disp);
@@ -384,6 +454,13 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     (lines, block_starts, group_tops)
 }
 
+fn count_for_repo_unfiltered(dash: &Dashboard, repo: &str) -> usize {
+    dash.sessions
+        .iter()
+        .filter(|s| s.repo_name.as_deref() == Some(repo))
+        .count()
+}
+
 fn agent_sort_key(k: AgentKind) -> u8 {
     match k {
         AgentKind::ClaudeCode => 0,
@@ -392,21 +469,6 @@ fn agent_sort_key(k: AgentKind) -> u8 {
         AgentKind::Gemini => 3,
         AgentKind::Unknown => 4,
     }
-}
-
-fn count_for_agent(dash: &Dashboard, agent: AgentKind) -> usize {
-    dash.sessions.iter().filter(|s| s.agent == agent).count()
-}
-
-fn count_for_repo(dash: &Dashboard, agent: AgentKind, repo: &str) -> usize {
-    dash.sessions.iter().filter(|s| s.agent == agent && s.repo_name.as_deref() == Some(repo)).count()
-}
-
-fn count_for_branch(dash: &Dashboard, agent: AgentKind, repo: &str, branch: &str) -> usize {
-    dash.sessions
-        .iter()
-        .filter(|s| s.agent == agent && s.repo_name.as_deref() == Some(repo) && s.branch.as_deref() == Some(branch))
-        .count()
 }
 
 fn push_session(
@@ -630,6 +692,8 @@ mod tests {
             tails: std::collections::HashMap::new(),
             selected: 0,
             last_discovery: std::time::Instant::now(),
+            show_done: false,
+            expanded: None,
         };
         let snapshot = sessions.clone();
         for s in &snapshot {
@@ -704,6 +768,97 @@ mod tests {
         // total=100, viewport=20, group header at line 99 → scroll to 80.
         assert_eq!(compute_scroll(Some(101), Some(99), 100, 20), 80);
     }
+
+    // session_visible — show_done filter.
+
+    fn sess_with_status(quick: crate::tree::SessionStatus) -> DiscoveredSession {
+        DiscoveredSession {
+            path: std::path::PathBuf::from(format!("/tmp/s-{quick:?}")),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            cwd: None,
+            worktree_name: None,
+            branch: Some("main".into()),
+            repo_name: Some("r".into()),
+            quick_status: quick,
+            task: None,
+            size_bytes: 0,
+            modified: None,
+            node_count_proxy: 0,
+        }
+    }
+
+    #[test]
+    fn session_visible_default_hides_done() {
+        let mut d = Dashboard {
+            sessions: vec![sess_with_status(crate::tree::SessionStatus::Done)],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            show_done: false,
+            expanded: None,
+        };
+        assert!(!d.session_visible(&d.sessions[0]));
+    }
+
+    #[test]
+    fn session_visible_show_done_includes_done() {
+        let mut d = Dashboard {
+            sessions: vec![sess_with_status(crate::tree::SessionStatus::Done)],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            show_done: true,
+            expanded: None,
+        };
+        assert!(d.session_visible(&d.sessions[0]));
+    }
+
+    #[test]
+    fn session_visible_keeps_running() {
+        let mut d = Dashboard {
+            sessions: vec![sess_with_status(crate::tree::SessionStatus::Running)],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            show_done: false,
+            expanded: None,
+        };
+        assert!(d.session_visible(&d.sessions[0]));
+    }
+
+    #[test]
+    fn toggle_show_done_flips_filter() {
+        let mut d = Dashboard {
+            sessions: vec![],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            show_done: false,
+            expanded: None,
+        };
+        assert!(!d.show_done);
+        d.toggle_show_done();
+        assert!(d.show_done);
+        d.toggle_show_done();
+        assert!(!d.show_done);
+    }
+
+    #[test]
+    fn toggle_expand_sets_and_clears() {
+        let mut d = Dashboard {
+            sessions: vec![sess_with_status(crate::tree::SessionStatus::Running)],
+            tails: std::collections::HashMap::new(),
+            selected: 0,
+            last_discovery: std::time::Instant::now(),
+            show_done: false,
+            expanded: None,
+        };
+        d.toggle_expand();
+        assert_eq!(d.expanded.as_ref(), Some(&d.sessions[0].path));
+        d.toggle_expand();
+        assert!(d.expanded.is_none());
+    }
 }
 
 /// App loop for dashboard mode: rediscovery + tails + keyboard.
@@ -764,6 +919,14 @@ fn handle_key(k: crossterm::event::KeyEvent, dash: &mut Dashboard) -> bool {
         KeyCode::Char('r') => {
             // Force rediscovery.
             dash.last_discovery = Duration::from_secs(99 * 60 * 60).into_std_instant();
+            false
+        }
+        KeyCode::Char('f') => {
+            dash.toggle_show_done();
+            false
+        }
+        KeyCode::Enter => {
+            dash.toggle_expand();
             false
         }
         _ => false,

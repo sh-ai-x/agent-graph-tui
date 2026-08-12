@@ -96,48 +96,52 @@ fn run_dashboard(started: Instant) -> ExitCode {
         // Plain-text: print each session header + first events.
         let stdout = std::io::stdout();
         let mut lock = stdout.lock();
+        // Re-render with the same hierarchy as the TUI: repo → branch.
+        // Apply the same `show_done` filter so text-mode and TUI-mode
+        // present the same set of sessions.
+        let mut sorted: Vec<usize> = dash
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| dash.session_visible(s))
+            .map(|(i, _)| i)
+            .collect();
+
+        let total = dash.sessions.len();
         let _ = writeln!(
             lock,
-            "agent-graph-tui — {} sessions (text mode, cold start {:.2} ms)",
-            dash.sessions.len(),
+            "agent-graph-tui — {} of {} sessions visible (text mode, cold start {:.2} ms)",
+            sorted.len(),
+            total,
             cold_start_ms
         );
-        // Re-render with the same hierarchy as the TUI: agent → repo → branch.
-        let mut sorted: Vec<usize> = (0..dash.sessions.len()).collect();
+        if sorted.is_empty() {
+            let _ = writeln!(
+                lock,
+                "\n(no active sessions — all {} are Done. The TUI `f` key toggles show-done.)",
+                total
+            );
+            return ExitCode::SUCCESS;
+        }
         sorted.sort_by(|&a, &b| {
             let sa = &dash.sessions[a];
             let sb = &dash.sessions[b];
             (
-                sa.agent as u8,
                 sa.repo_name.clone().unwrap_or_default(),
                 sa.branch.clone().unwrap_or_default(),
             )
                 .cmp(&(
-                    sb.agent as u8,
                     sb.repo_name.clone().unwrap_or_default(),
                     sb.branch.clone().unwrap_or_default(),
                 ))
         });
-        let mut last_agent: Option<agent_graph_tui::discovery::AgentKind> = None;
         let mut last_repo: Option<String> = None;
         let mut last_branch: Option<String> = None;
         for &idx in &sorted {
             let s = &dash.sessions[idx];
-            if last_agent != Some(s.agent) {
-                let _ = writeln!(
-                    lock,
-                    "\n{} {} ({} sessions)",
-                    s.agent.icon(),
-                    s.agent.label(),
-                    dash.sessions.iter().filter(|x| x.agent == s.agent).count()
-                );
-                last_agent = Some(s.agent);
-                last_repo = None;
-                last_branch = None;
-            }
             let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
             if last_repo.as_deref() != Some(repo_disp.as_str()) {
-                let _ = writeln!(lock, "  {repo_disp}");
+                let _ = writeln!(lock, "\n  {repo_disp}");
                 last_repo = Some(repo_disp);
                 last_branch = None;
             }
