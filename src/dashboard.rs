@@ -253,10 +253,11 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
     // Body lines.
     let inner_w = area.width.saturating_sub(2) as usize;
     let viewport = chunks[1].height as usize;
-    let (lines, block_starts) = build_lines(dash, inner_w);
+    let (lines, block_starts, group_tops) = build_lines(dash, inner_w);
 
     let scroll = compute_scroll(
         block_starts.get(dash.selected).copied(),
+        group_tops.get(dash.selected).copied(),
         lines.len(),
         viewport,
     );
@@ -285,9 +286,10 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
     f.render_widget(footer, chunks[2]);
 }
 
-fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut block_starts: Vec<usize> = Vec::new();
+    let mut group_tops: Vec<usize> = Vec::new();
 
     // Sort sessions by (agent, repo, branch, modified desc) for grouping.
     let mut sorted: Vec<usize> = (0..dash.sessions.len()).collect();
@@ -307,6 +309,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut last_agent: Option<AgentKind> = None;
     let mut last_repo: Option<String> = None;
     let mut last_branch: Option<String> = None;
+    let mut current_group_top: usize = 0;
 
     for &idx in &sorted {
         let s = &dash.sessions[idx];
@@ -314,6 +317,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         // Agent header — emit when agent kind changes.
         if last_agent != Some(s.agent) {
             let accent = agent_color(s.agent);
+            current_group_top = lines.len();
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", s.agent.icon()),
@@ -374,9 +378,10 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
 
         let accent = agent_color(s.agent);
         block_starts.push(lines.len());
+        group_tops.push(current_group_top);
         push_session(&mut lines, dash, s, idx, inner_w, accent);
     }
-    (lines, block_starts)
+    (lines, block_starts, group_tops)
 }
 
 fn agent_sort_key(k: AgentKind) -> u8 {
@@ -573,16 +578,25 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn compute_scroll(selected_start: Option<usize>, total: usize, viewport: usize) -> usize {
+fn compute_scroll(
+    selected_start: Option<usize>,
+    group_top: Option<usize>,
+    total: usize,
+    viewport: usize,
+) -> usize {
     let Some(start) = selected_start else {
         return 0;
     };
     if total <= viewport {
         return 0;
     }
-    let end_estimate = start + viewport.saturating_sub(1);
+    // Anchor the group header at the top of the viewport so the user
+    // always sees the agent/repo/branch context above the selected session.
+    let anchor = group_top.unwrap_or(start);
+    let end_estimate = anchor + viewport.saturating_sub(1);
     if end_estimate <= total {
-        0
+        // Selected (with its group headers) fits; align group_top to viewport top.
+        anchor
     } else {
         total.saturating_sub(viewport)
     }
@@ -670,23 +684,25 @@ mod tests {
 
     #[test]
     fn compute_scroll_returns_zero_when_no_selection() {
-        assert_eq!(compute_scroll(None, 100, 20), 0);
+        assert_eq!(compute_scroll(None, None, 100, 20), 0);
     }
 
     #[test]
     fn compute_scroll_returns_zero_when_total_within_viewport() {
-        assert_eq!(compute_scroll(Some(5), 10, 20), 0);
+        assert_eq!(compute_scroll(Some(5), Some(0), 10, 20), 0);
     }
 
     #[test]
-    fn compute_scroll_returns_end_anchor_when_selected_at_end() {
-        // total=100, viewport=20, selected at line 99 → scroll to 80.
-        assert_eq!(compute_scroll(Some(99), 100, 20), 80);
+    fn compute_scroll_anchors_group_top_at_viewport_top() {
+        // total=100, viewport=20, group header at line 50, session at line 53.
+        // We want the group header (line 50) to be the top of the viewport.
+        assert_eq!(compute_scroll(Some(53), Some(50), 100, 20), 50);
     }
 
     #[test]
-    fn compute_scroll_returns_zero_when_selected_visible_in_middle() {
-        assert_eq!(compute_scroll(Some(50), 100, 20), 0);
+    fn compute_scroll_returns_end_anchor_when_group_top_at_end() {
+        // total=100, viewport=20, group header at line 99 → scroll to 80.
+        assert_eq!(compute_scroll(Some(101), Some(99), 100, 20), 80);
     }
 }
 

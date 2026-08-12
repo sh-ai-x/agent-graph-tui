@@ -152,7 +152,7 @@ pub fn discover() -> DiscoveryReport {
         if let Some(b) = git_branch(&cwd).filter(|b| !b.is_empty()) {
             s.branch = Some(b);
         }
-        if let Some(root) = git_toplevel(&cwd) {
+        if let Some(root) = git_repo_root(&cwd) {
             s.repo_name = root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -161,6 +161,48 @@ pub fn discover() -> DiscoveryReport {
     }
 
     report
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+
+    fn run(cmd: &str) {
+        eprintln!("    run: {cmd}");
+    }
+
+    #[test]
+    fn git_repo_root_resolves_a_worktree_to_its_main_repo() {
+        // Setup: a worktree of `main` at `.worktrees/skill-chain-redesign`.
+        let dir = std::env::temp_dir().join(format!("agent-graph-tui-rroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main_repo = dir.join("main");
+        let wt = main_repo.join(".worktrees").join("skill-chain-redesign");
+        std::fs::create_dir_all(&wt).unwrap();
+        run(&format!("git init at {}", main_repo.display()));
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main_repo)
+            .args(["init", "--initial-branch=main"])
+            .output()
+            .unwrap();
+        run(&format!("git -C {} worktree add .worktrees/skill-chain-redesign -b skill-chain-redesign", main_repo.display()));
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main_repo)
+            .args(["worktree", "add", ".worktrees/skill-chain-redesign", "-b", "skill-chain-redesign"])
+            .output()
+            .unwrap();
+        let resolved = git_repo_root(&wt).expect("should resolve");
+        // We expect basename = `main`, NOT `skill-chain-redesign`.
+        assert_eq!(
+            resolved.file_name().map(|n| n.to_string_lossy().to_string()).as_deref(),
+            Some("main"),
+            "worktree toplevel should resolve to the main repo, got {:?}",
+            resolved
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 const MAX_SESSIONS: usize = 32;
@@ -412,22 +454,31 @@ fn git_branch(cwd: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    // `--show-toplevel` returns the cwd's worktree toplevel, which is the
+    // worktree dir for a linked worktree, not the main repo. We want the
+    // main repo's toplevel so the repo name is the project name (e.g. `main`),
+    // not the worktree branch dir (e.g. `skill-chain-redesign`).
+    //
+    // `--git-common-dir` returns the shared `.git/` dir for all worktrees
+    // of the same repo; `dirname` of that is the main repo's working tree.
     let out = Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(s))
+    let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if git_dir.is_empty() {
+        return None;
     }
+    // `.git/` → dirname → main repo's working tree.
+    let p = PathBuf::from(&git_dir);
+    let parent = p.parent()?;
+    Some(parent.to_path_buf())
 }
 
 #[cfg(test)]
