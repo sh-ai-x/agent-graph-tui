@@ -103,12 +103,30 @@ fn run_dashboard(started: Instant) -> ExitCode {
             cold_start_ms
         );
         for s in &dash.sessions {
-            let _ = writeln!(lock, "\n{} {} {}", s.agent.icon(), s.agent.label(), s.path.display());
+            let label = s
+                .repo_name
+                .clone()
+                .or_else(|| s.worktree_name.clone())
+                .unwrap_or_else(|| {
+                    let stem = s
+                        .path
+                        .file_stem()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    stem.get(..8).unwrap_or(stem.as_str()).to_string()
+                });
+            let model = s.model.clone().unwrap_or_else(|| "—".into());
+            let _ = writeln!(
+                lock,
+                "\n{} {} {} ⏵ {}",
+                s.agent.icon(),
+                s.agent.label(),
+                label,
+                s.branch.clone().unwrap_or_else(|| "—".into())
+            );
+            let _ = writeln!(lock, "  model: {model}");
             if let Some(t) = &s.task {
-                let _ = writeln!(lock, "  task: {}", t);
-            }
-            if let Some(b) = &s.branch {
-                let _ = writeln!(lock, "  branch: {b}");
+                let _ = writeln!(lock, "  task:  {t}");
             }
             if let Some(err) = dash.tails.get(&s.path).and_then(|t| t.last_error.as_ref()) {
                 let _ = writeln!(lock, "  ⚠ {err}");

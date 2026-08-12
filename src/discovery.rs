@@ -72,11 +72,20 @@ impl AgentKind {
 pub struct DiscoveredSession {
     pub path: PathBuf,
     pub agent: AgentKind,
-    /// Working directory the session was started from — decoded from the
-    /// Claude Code project-path encoding when applicable.
-    pub worktree: Option<PathBuf>,
-    /// `git -C <worktree> rev-parse --abbrev-ref HEAD`.
+    /// Display name of the model used in the first assistant message
+    /// (e.g. `claude-opus-4-8`, `MiniMax-M3`). The agent kind is the
+    /// runner; this is the actual LLM.
+    pub model: Option<String>,
+    /// Working directory the session was started from. Read from the
+    /// top-level `cwd` field of any JSONL line in the file.
+    pub cwd: Option<PathBuf>,
+    /// Worktree name extracted from the project's `--worktrees-X` suffix,
+    /// when applicable (Claude Code only).
+    pub worktree_name: Option<String>,
+    /// `git -C <cwd> rev-parse --abbrev-ref HEAD`.
     pub branch: Option<String>,
+    /// `git -C <cwd> rev-parse --show-toplevel` → basename.
+    pub repo_name: Option<String>,
     /// First user message, trimmed.
     pub task: Option<String>,
     pub size_bytes: u64,
@@ -124,10 +133,26 @@ pub fn discover() -> DiscoveryReport {
         .sort_by(|a, b| b.modified.cmp(&a.modified));
     report.sessions.truncate(MAX_SESSIONS);
 
-    // Phase 2: enrich the survivors with branch info (one git fork per session).
+    // Phase 2: enrich the survivors with git-derived info (one git fork per
+    // session). Uses the cwd that's recorded in the JSONL's top-level
+    // `cwd` field first; falls back to the current working directory (the
+    // directory the user invoked `agent-graph-tui` from) when the JSONL head
+    // doesn't carry `cwd`. The encoded project path is never used as cwd.
+    let fallback_cwd = std::env::current_dir().ok();
     for s in &mut report.sessions {
-        if let Some(wt) = &s.worktree {
-            s.branch = git_branch(wt).filter(|b| !b.is_empty());
+        let cwd = s.cwd.clone().or_else(|| fallback_cwd.clone());
+        let Some(cwd) = cwd else { continue };
+        if !cwd.exists() {
+            continue;
+        }
+        if let Some(b) = git_branch(&cwd).filter(|b| !b.is_empty()) {
+            s.branch = Some(b);
+        }
+        if let Some(root) = git_toplevel(&cwd) {
+            s.repo_name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .filter(|n| !n.is_empty());
         }
     }
 
@@ -183,17 +208,21 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
     let head_str = std::str::from_utf8(&head[..n]).unwrap_or("");
 
     let agent = AgentKind::from_path(path);
+    let model = extract_model(head_str);
+    let cwd = extract_cwd(head_str);
+    let worktree_name = extract_worktree_name(path);
     let task = first_user_message(head_str);
-    let worktree = decode_worktree_from_path(path, agent);
-    // Branch populated later via enrich step in `discover()`.
 
     let node_count_proxy = head_str.bytes().filter(|&b| b == b'\n').count();
 
     Some(DiscoveredSession {
         path: path.to_path_buf(),
         agent,
-        worktree,
+        model,
+        cwd,
+        worktree_name,
         branch: None,
+        repo_name: None,
         task,
         size_bytes: size,
         modified,
@@ -248,31 +277,74 @@ fn unescape(s: &str) -> String {
         .to_string()
 }
 
-/// Claude Code encodes the project path by replacing `/` with `-` and
-/// prepending `-`. E.g. `/Users/foo/bar` → `-Users-foo-bar`.
-fn decode_worktree_from_path(path: &Path, agent: AgentKind) -> Option<PathBuf> {
-    if agent != AgentKind::ClaudeCode {
-        return path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .or_else(|| Some(path.to_path_buf()));
+/// Pulls the cwd from the first JSONL line that has a top-level `cwd`
+/// field. Claude Code writes this on every line in the session file.
+fn extract_cwd(head: &str) -> Option<PathBuf> {
+    for line in head.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            if !cwd.is_empty() {
+                return Some(PathBuf::from(cwd));
+            }
+        }
     }
-    let comp = path
-        .components()
-        .find(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            s.starts_with('-') && s.len() > 1
-        })?
-        .as_os_str()
-        .to_string_lossy()
-        .trim_start_matches('-')
-        .to_string();
-    let decoded = if comp.starts_with("Users/") || comp.starts_with("home/") {
-        format!("/{comp}")
-    } else {
-        format!("/{comp}")
-    };
-    Some(PathBuf::from(decoded))
+    None
+}
+
+/// Pulls the model name from the first assistant message in the head.
+/// Returns `None` if the field isn't present (older rows, error lines, etc.).
+fn extract_model(head: &str) -> Option<String> {
+    for line in head.lines() {
+        if !line.contains("\"type\":\"assistant\"") {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(m) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(m.to_string());
+        }
+    }
+    None
+}
+
+/// Pulls the worktree name out of the project dir's `--worktrees-X` suffix,
+/// when the session was started inside a git worktree. Returns `None` for
+/// sessions started in the main repo.
+fn extract_worktree_name(path: &Path) -> Option<String> {
+    let dir = path.parent()?.file_name()?.to_string_lossy();
+    let stripped = dir.trim_start_matches('-');
+    stripped
+        .find("--worktrees-")
+        .map(|i| stripped[i + "--worktrees-".len()..].to_string())
+}
+
+/// Best-effort: find the actual cwd that the session was started from, so
+/// we can run `git -C <cwd>` to get branch info. The encoded project dir
+/// (`~/.claude/projects/-Users-foo-bar--worktrees-X`) does NOT exist on disk,
+/// so we have to reconstruct the cwd.
+///
+/// Strategy: if the worktree-name is known, look in `$HOME/.claude/...`
+/// worktree metadata. Otherwise, take the parent of the file's directory
+/// and walk up looking for a `.git` directory.
+fn guess_real_cwd(jsonl_path: &Path, worktree_name: &Option<String>) -> Option<PathBuf> {
+    // For now, return the parent of the jsonl file — this is the
+    // `~/.claude/projects/<encoded>` directory; if git has metadata there
+    // we can use it. Fall back to None.
+    if let Some(wt) = worktree_name {
+        // Common pattern: project cwd is the parent of the worktree dir.
+        // We don't have the project root, so return None for now.
+        let _ = (jsonl_path, wt);
+    }
+    None
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
@@ -286,6 +358,24 @@ fn git_branch(cwd: &Path) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
 }
 
 #[cfg(test)]
@@ -338,12 +428,33 @@ mod tests {
     }
 
     #[test]
-    fn decode_worktree_roundtrips_claude_project_path() {
-        let p = Path::new("/home/u/.claude/projects/-Users-foo-bar/abc.jsonl");
-        let wt = decode_worktree_from_path(p, AgentKind::ClaudeCode).unwrap();
-        // /Users-foo-bar is the literal Claude Code encoding (escaped) of a
-        // path whose separators are ambiguous. We assert the literal form,
-        // not the un-recoverable multi-segment form.
-        assert_eq!(wt, PathBuf::from("/Users-foo-bar"));
+    fn extract_worktree_name_parses_dash_double_worktrees() {
+        let p = Path::new(
+            "/home/u/.claude/projects/-Users-sanghee-dev-agent-graph-tui--worktrees-multi-session-dashboard/abc.jsonl",
+        );
+        let name = extract_worktree_name(p).unwrap();
+        assert_eq!(name, "multi-session-dashboard");
+    }
+
+    #[test]
+    fn extract_worktree_name_returns_none_for_bare_repo() {
+        let p = Path::new("/home/u/.claude/projects/-Users-sanghee-dev-agent-graph-tui/abc.jsonl");
+        let name = extract_worktree_name(p);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn extract_model_picks_up_first_assistant_model_field() {
+        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+                    {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
+        let model = extract_model(head).unwrap();
+        assert_eq!(model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn extract_model_returns_none_when_no_assistant() {
+        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+        let model = extract_model(head);
+        assert!(model.is_none());
     }
 }
