@@ -399,26 +399,6 @@ fn extract_worktree_name(path: &Path) -> Option<String> {
         .map(|i| stripped[i + "--worktrees-".len()..].to_string())
 }
 
-/// Best-effort: find the actual cwd that the session was started from, so
-/// we can run `git -C <cwd>` to get branch info. The encoded project dir
-/// (`~/.claude/projects/-Users-foo-bar--worktrees-X`) does NOT exist on disk,
-/// so we have to reconstruct the cwd.
-///
-/// Strategy: if the worktree-name is known, look in `$HOME/.claude/...`
-/// worktree metadata. Otherwise, take the parent of the file's directory
-/// and walk up looking for a `.git` directory.
-fn guess_real_cwd(jsonl_path: &Path, worktree_name: &Option<String>) -> Option<PathBuf> {
-    // For now, return the parent of the jsonl file — this is the
-    // `~/.claude/projects/<encoded>` directory; if git has metadata there
-    // we can use it. Fall back to None.
-    if let Some(wt) = worktree_name {
-        // Common pattern: project cwd is the parent of the worktree dir.
-        // We don't have the project root, so return None for now.
-        let _ = (jsonl_path, wt);
-    }
-    None
-}
-
 fn git_branch(cwd: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")

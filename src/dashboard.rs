@@ -336,7 +336,6 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         // Repo header — emit when repo changes within the same agent.
         let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
         if last_repo.as_deref() != Some(repo_disp.as_str()) {
-            let accent = agent_color(s.agent);
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
