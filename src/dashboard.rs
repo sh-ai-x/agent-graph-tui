@@ -288,11 +288,6 @@ fn push_block(
     let marker = if idx == dash.selected { "▶ " } else { "  " };
     let accent = agent_color(s.agent);
 
-    let worktree = s
-        .worktree
-        .as_ref()
-        .map(|p| shorten_path(p, inner_w))
-        .unwrap_or_else(|| s.path.to_string_lossy().to_string());
     let branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
     let task = s.task.clone().unwrap_or_default();
     let task_trim = truncate(&task, inner_w.saturating_sub(20));
@@ -303,31 +298,46 @@ fn push_block(
         .map(|d| format_relative(d.as_secs()))
         .unwrap_or_else(|| "?".into());
 
-    lines.push(Line::from(vec![
-        Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!("{} ", s.agent.icon()),
-            Style::default().fg(accent),
-        ),
-        Span::styled(
-            format!("{:<11}", s.agent.label()),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(worktree, Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled(
+    // Header: agent icon + agent kind + model + branch + worktree + counts.
+    lines.push(Line::from({
+        let mut spans = vec![
+            Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ", s.agent.icon()),
+                Style::default().fg(accent),
+            ),
+            Span::styled(
+                format!("{:<11}", s.agent.label()),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(model) = &s.model {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                model_short(model),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        spans.push(Span::raw("  "));
+        if let Some(wt) = &s.worktree_name {
+            spans.push(Span::styled(
+                format!("{wt} "),
+                Style::default().fg(Color::White),
+            ));
+        }
+        spans.push(Span::styled(
             format!("⏵ {branch}"),
             Style::default().fg(accent),
-        ),
-        Span::raw("  "),
-        Span::styled(
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
             format!("{node_count} nodes"),
             Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled(modified, Style::default().fg(Color::DarkGray)),
-    ]));
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(modified, Style::default().fg(Color::DarkGray)));
+        Line::from(spans)
+    }));
 
     if !task_trim.is_empty() {
         lines.push(Line::from(vec![
@@ -411,17 +421,20 @@ fn agent_color(kind: AgentKind) -> Color {
     }
 }
 
-fn shorten_path(p: &Path, max: usize) -> String {
-    let s = p.to_string_lossy().to_string();
-    if s.chars().count() <= max {
-        return s;
+/// Shorten a model identifier to its family + version (drops vendor prefixes).
+fn model_short(model: &str) -> String {
+    // "claude-opus-4-8"        -> "claude-opus-4-8"
+    // "claude-3-5-sonnet-..."   -> "claude-3-5-sonnet"
+    // "MiniMax-M3[1m]"     -> "minimax-m3"
+    let m = model.to_lowercase();
+    if let Some(stripped) = m.strip_prefix("claude-") {
+        stripped.split('-').take(3).collect::<Vec<_>>().join("-")
+    } else if m.contains("minimax") {
+        "minimax".to_string()
+    } else {
+        // First 8 chars, lowercase
+        m.chars().take(8).collect()
     }
-    let total = s.chars().count();
-    let keep: String = s
-        .chars()
-        .skip(total.saturating_sub(max.saturating_sub(2)))
-        .collect();
-    format!("…/{keep}")
 }
 
 fn format_relative(secs_since_epoch: u64) -> String {

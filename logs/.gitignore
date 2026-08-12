@@ -1,0 +1,7 @@
+# ignore captured transcripts
+*.jsonl
+
+# keep these subdirs present
+!.gitkeep
+!claude-code/
+!codex/
