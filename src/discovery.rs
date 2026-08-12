@@ -257,7 +257,7 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
     let head_str = std::str::from_utf8(&head).unwrap_or("");
 
     let agent = AgentKind::from_path(path);
-    let model = extract_model(head_str);
+    let model = extract_model(path);
     let cwd = extract_cwd(head_str);
     let worktree_name = extract_worktree_name(path);
     let task = first_user_message(head_str);
@@ -408,23 +408,51 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
     tree::SessionStatus::Done
 }
 
-/// Pulls the model name from the first assistant message in the head.
-/// Returns `None` if the field isn't present (older rows, error lines, etc.).
-fn extract_model(head: &str) -> Option<String> {
-    for line in head.lines() {
-        if !line.contains("\"type\":\"assistant\"") {
+/// Probe a parsed JSONL line for the model name. Different agent CLIs
+/// put the model field in different places:
+///
+/// - Claude Code / MiniMax inside Claude Code:  `message.model`
+/// - Codex (openai's CLI):                       `payload.model`
+/// - Future / one-off formats:                   top-level `model`
+///
+/// Returns the first non-empty match across these paths, in order.
+fn model_from_value(v: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        v.get("message").and_then(|m| m.get("model")),
+        v.get("payload").and_then(|p| p.get("model")),
+        v.get("response").and_then(|r| r.get("model")),
+        v.get("model"),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|m| m.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Walk up to 1 MiB of the file, line by line, looking for the first
+/// JSONL line that has a model field. The previous head-only scan missed
+/// large sessions whose first assistant message was past 64 KiB.
+fn extract_model(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let read_up_to = len.min(1024 * 1024);
+    let mut buf = vec![0u8; read_up_to as usize];
+    let _ = f.read(&mut buf).ok()?;
+    let text = std::str::from_utf8(&buf).unwrap_or("");
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Some(m) = v
-            .get("message")
-            .and_then(|m| m.get("model"))
-            .and_then(|m| m.as_str())
-        {
-            return Some(m.to_string());
+        if let Some(m) = model_from_value(&v) {
+            return Some(m);
         }
     }
     None
@@ -547,18 +575,72 @@ mod tests {
     }
 
       #[test]
-    fn extract_model_picks_up_first_assistant_model_field() {
-        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
-                    {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n";
-        let model = extract_model(head).unwrap();
+    fn extract_model_picks_up_message_model_field() {
+        let path = write_temp_jsonl(
+            "claude_code",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n",
+        );
+        let model = extract_model(&path).unwrap();
         assert_eq!(model, "claude-opus-4-8");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn extract_model_returns_none_when_no_assistant() {
-        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
-        let model = extract_model(head);
+    fn extract_model_picks_up_payload_model_field_for_codex() {
+        let path = write_temp_jsonl(
+            "codex",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"model\":\"gpt-4o\"}}\n",
+        );
+        let model = extract_model(&path).unwrap();
+        assert_eq!(model, "gpt-4o");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_picks_up_top_level_model_field() {
+        let path = write_temp_jsonl(
+            "top_level",
+            "{\"type\":\"response\",\"model\":\"o1-preview\",\"content\":\"...\"}\n",
+        );
+        let model = extract_model(&path).unwrap();
+        assert_eq!(model, "o1-preview");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_returns_none_when_no_model_field_anywhere() {
+        let path = write_temp_jsonl(
+            "no_model",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+        );
+        let model = extract_model(&path);
         assert!(model.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_picks_up_model_in_later_lines_not_just_head() {
+        // The first 200 bytes are a user message + first assistant reply
+        // (no model field — it's a placeholder). The model field appears
+        // ~50 KB later. With the 64 KiB head scan we'd miss it.
+        let mut buf = String::new();
+        buf.push_str("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n");
+        buf.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"thinking\"}]}}\n");
+        // Pad with placeholder assistant replies (no model) to push the
+        // real one past 64 KiB.
+        for _ in 0..300 {
+            buf.push_str(
+                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}\n",
+            );
+        }
+        buf.push_str("{\"type\":\"assistant\",\"message\":{\"id\":\"m_real\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-7\",\"content\":[{\"type\":\"text\",\"text\":\"real answer\"}]}}\n");
+        let path = write_temp_jsonl("late_model", &buf);
+        let model = extract_model(&path).unwrap();
+        assert_eq!(model, "claude-sonnet-4-7");
+        let _ = std::fs::remove_file(&path);
     }
 
     // quick_status — exercises the last-event probe used by the text-mode
