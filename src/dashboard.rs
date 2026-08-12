@@ -51,15 +51,30 @@ pub struct Dashboard {
     pub sessions: Vec<DiscoveredSession>,
     pub tails: HashMap<PathBuf, TailState>,
     pub selected: usize,
+    /// Where the user is in the hierarchy.
+    /// `[]` = top level (list of repos).
+    /// `["repo"]` = inside that repo (list of branches).
+    /// `["repo", "branch"]` = inside that branch (list of sessions, with
+    /// the execution graph rendered for each).
+    pub nav_path: Vec<String>,
     pub last_discovery: Instant,
     /// When false (default), sessions with status `Done` are hidden. Toggle
     /// with `f`. Rationale: a finished session is no longer interesting
     /// unless you're reviewing history; running/pending/failed/blocked all
     /// deserve attention.
     pub show_done: bool,
-    /// Path of the session whose execution graph is expanded. `None` means
-    /// no session is expanded — `Enter` toggles.
+    /// Path of the session whose execution graph is force-expanded. Most
+    /// sessions now auto-show their graph; this is kept so `Enter` still
+    /// means "force-expand this one" when the user wants the full tree.
     pub expanded: Option<PathBuf>,
+}
+
+/// One item in the current nav level.
+#[derive(Debug, Clone)]
+enum NavItem {
+    Repo(String),
+    Branch(String),
+    Session(usize), // index into dash.sessions
 }
 
 impl Dashboard {
@@ -89,6 +104,7 @@ impl Dashboard {
             sessions: Vec::new(),
             tails: HashMap::new(),
             selected: 0,
+            nav_path: Vec::new(),
             last_discovery: Instant::now(),
             show_done: false,
             expanded: None,
@@ -172,8 +188,8 @@ impl Dashboard {
         for s in &snapshot {
             self.ensure_tail(s);
         }
-        if self.selected >= self.sessions.len() {
-            self.selected = self.sessions.len().saturating_sub(1);
+        if self.selected >= self.nav_items().len() {
+            self.selected = self.nav_items().len().saturating_sub(1);
         }
         self.last_discovery = Instant::now();
     }
@@ -214,8 +230,12 @@ impl Dashboard {
         }
     }
 
+    /// The session for the currently-focused nav item, if any. Returns
+    /// `Some(&DiscoveredSession)` only when the nav is at Sessions level
+    /// and the focused item is a session.
     pub fn selected_session(&self) -> Option<&DiscoveredSession> {
-        self.sessions.get(self.selected)
+        let idx = self.focused_session()?;
+        self.sessions.get(idx)
     }
 
     pub fn selected_tail(&self) -> Option<&TailState> {
@@ -223,10 +243,11 @@ impl Dashboard {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.sessions.is_empty() {
+        let n = self.nav_items().len();
+        if n == 0 {
             return;
         }
-        let n = self.sessions.len() as isize;
+        let n = n as isize;
         let mut i = self.selected as isize + delta;
         if i < 0 {
             i = 0;
@@ -235,18 +256,106 @@ impl Dashboard {
             i = n - 1;
         }
         self.selected = i as usize;
-        // Auto-load on focus so the execution graph renders without manual action.
-        self.ensure_loaded(self.selected);
+        if let Some(s) = self.focused_session() {
+            self.ensure_loaded(s);
+        }
     }
 
-    /// Toggle expansion of the selected session (Enter key).
+    /// Items in the current nav level. Top level = repos; inside a repo
+    /// = branches; inside a branch = sessions.
+    fn nav_items(&self) -> Vec<NavItem> {
+        let filtered: Vec<&DiscoveredSession> = self
+            .sessions
+            .iter()
+            .filter(|s| self.session_visible(s))
+            .collect();
+        match self.nav_path.len() {
+            0 => {
+                let mut repos: Vec<String> = filtered
+                    .iter()
+                    .filter_map(|s| s.repo_name.clone())
+                    .collect();
+                repos.sort();
+                repos.dedup();
+                repos.into_iter().map(NavItem::Repo).collect()
+            }
+            1 => {
+                let repo = &self.nav_path[0];
+                let mut branches: Vec<String> = filtered
+                    .iter()
+                    .filter(|s| s.repo_name.as_deref() == Some(repo.as_str()))
+                    .filter_map(|s| s.branch.clone())
+                    .collect();
+                branches.sort();
+                branches.dedup();
+                branches.into_iter().map(NavItem::Branch).collect()
+            }
+            _ => {
+                let repo = &self.nav_path[0];
+                let branch = &self.nav_path[1];
+                filtered
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.repo_name.as_deref() == Some(repo.as_str()))
+                    .filter(|(_, s)| s.branch.as_deref() == Some(branch.as_str()))
+                    .map(|(i, _)| NavItem::Session(i))
+                    .collect()
+            }
+        }
+    }
+
+    /// The currently focused session, if we're at Sessions level and
+    /// nav_index points at one.
+    pub fn focused_session(&self) -> Option<usize> {
+        if self.nav_path.len() != 2 {
+            return None;
+        }
+        match self.nav_items().get(self.selected)? {
+            NavItem::Session(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Drill into the focused item: Repos → Branches in repo; Branches
+    /// → Sessions in branch; Sessions → toggles expand.
+    pub fn drill_down(&mut self) {
+        let items = self.nav_items();
+        if let Some(item) = items.get(self.selected).cloned() {
+            match item {
+                NavItem::Repo(name) => {
+                    self.nav_path.push(name);
+                    self.selected = 0;
+                }
+                NavItem::Branch(name) => {
+                    self.nav_path.push(name);
+                    self.selected = 0;
+                }
+                NavItem::Session(_) => {
+                    self.toggle_expand();
+                }
+            }
+        }
+    }
+
+    /// Drill back up the hierarchy.
+    pub fn drill_up(&mut self) {
+        if !self.nav_path.is_empty() {
+            self.nav_path.pop();
+            self.selected = 0;
+        }
+    }
+
+    /// Toggle expansion of the selected session (Enter key in Sessions view).
     pub fn toggle_expand(&mut self) {
-        if let Some(s) = self.sessions.get(self.selected) {
-            if self.expanded.as_ref() == Some(&s.path) {
-                self.expanded = None;
-            } else {
-                self.expanded = Some(s.path.clone());
-                self.ensure_loaded(self.selected);
+        if let Some(s) = self.focused_session() {
+            if let Some(session) = self.sessions.get(s) {
+                let path = session.path.clone();
+                if self.expanded.as_ref() == Some(&path) {
+                    self.expanded = None;
+                } else {
+                    self.expanded = Some(path);
+                    self.ensure_loaded(s);
+                }
             }
         }
     }
@@ -274,18 +383,23 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
         .split(area);
 
     // Header
+    let nav_label = match dash.nav_path.len() {
+        0 => "repos".to_string(),
+        1 => format!("{} / branches", dash.nav_path[0]),
+        _ => format!("{} / {} / sessions", dash.nav_path[0], dash.nav_path[1]),
+    };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
             "agent-graph-tui ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} active sessions", dash.sessions.len()),
+            format!("{} · {} active sessions", nav_label, dash.sessions.len()),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            "↑/↓ select   ⏎ expand   f filter   q quit",
+            "↑/↓ move   ⏎ drill-down   ⌫ drill-up   f filter   q quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]))
@@ -323,7 +437,7 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
         ),
         Span::styled(
             format!(
-                "  ⏎ expand · f filter ({filter_label}) · r refresh · q quit"
+                "  ⏎ drill-down · ⌫ drill-up · f filter ({filter_label}) · r refresh · q quit"
             ),
             Style::default().fg(Color::DarkGray),
         ),
@@ -336,13 +450,27 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut block_starts: Vec<usize> = Vec::new();
     let mut group_tops: Vec<usize> = Vec::new();
 
-    // Filter by `show_done`, then sort by (repo, agent, branch, modified desc)
-    // so the user sees repos as the outer group and branches within.
+    // Filter by `show_done`, by `nav_path` (repo / branch scope), then sort
+    // by (repo, agent, branch, modified desc) so the user sees repos as
+    // the outer group and branches within.
     let mut sorted: Vec<usize> = dash
         .sessions
         .iter()
         .enumerate()
         .filter(|(_, s)| dash.session_visible(s))
+        .filter(|(_, s)| {
+            if let Some(repo) = dash.nav_path.first() {
+                if s.repo_name.as_deref() != Some(repo.as_str()) {
+                    return false;
+                }
+            }
+            if dash.nav_path.len() >= 2 {
+                if s.branch.as_deref() != Some(dash.nav_path[1].as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
         .map(|(i, _)| i)
         .collect();
     sorted.sort_by(|&a, &b| {
@@ -384,7 +512,8 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         let s = &dash.sessions[idx];
 
         // Repo header — emit on change. Always shown, since this is the
-        // top-level navigation unit.
+        // top-level navigation unit. (When nav_path has 1+ elements, this
+        // only emits once at the top of the view.)
         let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
         if last_repo.as_deref() != Some(repo_disp.as_str()) {
             let total_in_repo = repo_agents
@@ -392,8 +521,13 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                 .map(|_| count_for_repo_unfiltered(dash, &repo_disp))
                 .unwrap_or(0);
             current_group_top = lines.len();
+            let crumb = if dash.nav_path.is_empty() {
+                "📁 ".to_string()
+            } else {
+                " ".repeat(dash.nav_path.len()) + "↳ "
+            };
             lines.push(Line::from(vec![
-                Span::raw("📁 "),
+                Span::raw(crumb),
                 Span::styled(
                     format!("{:<22}", repo_disp),
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
@@ -691,6 +825,7 @@ mod tests {
             sessions: Vec::new(),
             tails: std::collections::HashMap::new(),
             selected: 0,
+            nav_path: Vec::new(),
             last_discovery: std::time::Instant::now(),
             show_done: false,
             expanded: None,
@@ -796,6 +931,7 @@ mod tests {
             selected: 0,
             last_discovery: std::time::Instant::now(),
             show_done: false,
+            nav_path: Vec::new(),
             expanded: None,
         };
         assert!(!d.session_visible(&d.sessions[0]));
@@ -809,6 +945,7 @@ mod tests {
             selected: 0,
             last_discovery: std::time::Instant::now(),
             show_done: true,
+            nav_path: Vec::new(),
             expanded: None,
         };
         assert!(d.session_visible(&d.sessions[0]));
@@ -822,6 +959,7 @@ mod tests {
             selected: 0,
             last_discovery: std::time::Instant::now(),
             show_done: false,
+            nav_path: Vec::new(),
             expanded: None,
         };
         assert!(d.session_visible(&d.sessions[0]));
@@ -835,6 +973,7 @@ mod tests {
             selected: 0,
             last_discovery: std::time::Instant::now(),
             show_done: false,
+            nav_path: Vec::new(),
             expanded: None,
         };
         assert!(!d.show_done);
@@ -852,6 +991,7 @@ mod tests {
             selected: 0,
             last_discovery: std::time::Instant::now(),
             show_done: false,
+            nav_path: vec!["r".into(), "main".into()],
             expanded: None,
         };
         d.toggle_expand();
@@ -911,8 +1051,9 @@ fn handle_key(k: crossterm::event::KeyEvent, dash: &mut Dashboard) -> bool {
             false
         }
         KeyCode::Char('G') => {
-            if !dash.sessions.is_empty() {
-                dash.selected = dash.sessions.len() - 1;
+            let n = dash.nav_items().len();
+            if n > 0 {
+                dash.selected = n - 1;
             }
             false
         }
@@ -926,7 +1067,14 @@ fn handle_key(k: crossterm::event::KeyEvent, dash: &mut Dashboard) -> bool {
             false
         }
         KeyCode::Enter => {
-            dash.toggle_expand();
+            // Drill down: Repos → Branches in repo; Branches → Sessions in
+            // branch; Sessions → toggle expand on the focused session.
+            dash.drill_down();
+            false
+        }
+        KeyCode::Backspace => {
+            // Drill back up: Sessions → Branches; Branches → Repos; Repos → no-op.
+            dash.drill_up();
             false
         }
         _ => false,

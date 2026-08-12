@@ -51,10 +51,11 @@ impl SessionStatus {
         }
     }
 
-    /// CSS-style color hint for the glyph.
+    /// CSS-style color hint for the glyph. Running = cyan to make the
+    /// "currently active" session pop against the muted Done rows.
     pub fn color(self) -> Color {
         match self {
-            Self::Running => Color::Green,
+            Self::Running => Color::Cyan,
             Self::Done => Color::DarkGray,
             Self::Failed => Color::Red,
             Self::Blocked => Color::Yellow,
