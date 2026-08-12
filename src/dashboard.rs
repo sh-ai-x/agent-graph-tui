@@ -1,0 +1,541 @@
+//! Multi-session dashboard state: discovery + per-session tail + tree cache.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::Terminal;
+use ratatui::backend::Backend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Frame;
+
+use crate::discovery::{AgentKind, DiscoveryReport, DiscoveredSession};
+use crate::tree::{Node, NodeKind, Status};
+use crate::{parser, tree};
+
+const MAX_SESSIONS: usize = 32;
+const RESCAN_BUDGET: Duration = Duration::from_millis(100);
+const REDISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+
+pub struct TailState {
+    pub parser: Option<parser::Session>,
+    pub tree: tree::Session,
+    pub consumed: usize,
+    pub offset: u64,
+    pub last_rescan: Instant,
+    pub last_error: Option<String>,
+    pub loaded: bool,
+}
+
+impl TailState {
+    fn unloaded() -> Self {
+        Self {
+            parser: None,
+            tree: tree::Session::new(),
+            consumed: 0,
+            offset: 0,
+            last_rescan: Instant::now(),
+            last_error: None,
+            loaded: false,
+        }
+    }
+}
+
+pub struct Dashboard {
+    pub sessions: Vec<DiscoveredSession>,
+    pub tails: HashMap<PathBuf, TailState>,
+    pub selected: usize,
+    pub last_discovery: Instant,
+}
+
+impl Dashboard {
+    pub fn from_report(report: DiscoveryReport) -> Self {
+        let sessions: Vec<_> = report.sessions.into_iter().take(MAX_SESSIONS).collect();
+        let mut dash = Self {
+            sessions: Vec::new(),
+            tails: HashMap::new(),
+            selected: 0,
+            last_discovery: Instant::now(),
+        };
+        // Lazy: insert metadata-only entries; defer full parse to load_tail().
+        for s in &sessions {
+            dash.tails
+                .entry(s.path.clone())
+                .or_insert_with(|| TailState::unloaded());
+        }
+        dash.sessions = sessions;
+        dash
+    }
+
+    fn ensure_tail(&mut self, s: &DiscoveredSession) {
+        self.tails
+            .entry(s.path.clone())
+            .or_insert_with(TailState::unloaded);
+    }
+
+    /// Open the parser and build the initial tree for a session; idempotent.
+    pub fn load_tail(&mut self, path: &Path) -> bool {
+        let needs_load = self
+            .tails
+            .get(path)
+            .map(|t| !t.loaded)
+            .unwrap_or(true);
+        if !needs_load {
+            return false;
+        }
+        match parser::Session::open(path) {
+            Ok(p) => {
+                let offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let consumed = p.events.len();
+                let built = tree::Session::build(&p);
+                if let Some(tail) = self.tails.get_mut(path) {
+                    tail.parser = Some(p);
+                    tail.tree = built;
+                    tail.consumed = consumed;
+                    tail.offset = offset;
+                    tail.loaded = true;
+                    tail.last_error = None;
+                }
+                true
+            }
+            Err(e) => {
+                if let Some(tail) = self.tails.get_mut(path) {
+                    tail.last_error = Some(e.to_string());
+                    tail.loaded = false;
+                }
+                false
+            }
+        }
+    }
+
+    /// Toggle a non-selected tail loaded — used by the renderer before drawing
+    /// its execution graph so the user sees fresh data immediately.
+    pub fn ensure_loaded(&mut self, idx: usize) {
+        if let Some(s) = self.sessions.get(idx).cloned() {
+            self.load_tail(&s.path);
+        }
+    }
+
+    pub fn tick_discovery(&mut self) {
+        if self.last_discovery.elapsed() < REDISCOVERY_BUDGET {
+            return;
+        }
+        let report = crate::discovery::discover();
+        self.sessions = report.sessions.into_iter().take(MAX_SESSIONS).collect();
+        self.tails
+            .retain(|path, _| self.sessions.iter().any(|s| &s.path == path));
+        let snapshot = self.sessions.clone();
+        for s in &snapshot {
+            self.ensure_tail(s);
+        }
+        if self.selected >= self.sessions.len() {
+            self.selected = self.sessions.len().saturating_sub(1);
+        }
+        self.last_discovery = Instant::now();
+    }
+
+    pub fn tick_tails(&mut self) {
+        for (path, tail) in self.tails.iter_mut() {
+            if !tail.loaded {
+                continue;
+            }
+            if tail.last_rescan.elapsed() < RESCAN_BUDGET {
+                continue;
+            }
+            let parser = match tail.parser.as_mut() {
+                Some(p) => p,
+                None => continue,
+            };
+            match parser.rescan_from(tail.offset) {
+                Ok(outcome) => {
+                    tail.offset = outcome.new_offset;
+                    tail.last_error = None;
+                    let cur_len = parser.events.len();
+                    if outcome.rebuilt || cur_len < tail.consumed {
+                        tail.tree = tree::Session::build(parser);
+                    } else if cur_len > tail.consumed {
+                        let delta = &parser.events[tail.consumed..cur_len];
+                        tail.tree.extend_from(delta);
+                    }
+                    tail.consumed = cur_len;
+                }
+                Err(e) => {
+                    tail.last_error = Some(e.to_string());
+                }
+            }
+            tail.last_rescan = Instant::now();
+            let _ = path; // silence unused warning when not consumed
+        }
+    }
+
+    pub fn selected_session(&self) -> Option<&DiscoveredSession> {
+        self.sessions.get(self.selected)
+    }
+
+    pub fn selected_tail(&self) -> Option<&TailState> {
+        self.selected_session().and_then(|s| self.tails.get(&s.path))
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let n = self.sessions.len() as isize;
+        let mut i = self.selected as isize + delta;
+        if i < 0 {
+            i = 0;
+        }
+        if i >= n {
+            i = n - 1;
+        }
+        self.selected = i as usize;
+        // Auto-load on focus so the execution graph renders without manual action.
+        self.ensure_loaded(self.selected);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Multi-session dashboard rendering (kept alongside the state for
+// simpler borrow checking — the renderer needs &Dashboard).
+// ─────────────────────────────────────────────────────────────────
+
+pub fn draw(f: &mut Frame, dash: &Dashboard) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Header
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "agent-graph-tui ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} active sessions", dash.sessions.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "↑/↓ select   ⏎ expand   q quit",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(header, chunks[0]);
+
+    // Body lines.
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let viewport = chunks[1].height as usize;
+    let (lines, block_starts) = build_lines(dash, inner_w);
+
+    let scroll = compute_scroll(
+        block_starts.get(dash.selected).copied(),
+        lines.len(),
+        viewport,
+    );
+    let skip = scroll.min(lines.len());
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(skip).collect();
+    f.render_widget(
+        Paragraph::new(visible).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+
+    // Footer
+    let selected_label = dash
+        .selected_session()
+        .map(|s| format!("{}/{} · {}", dash.selected + 1, dash.sessions.len(), s.agent.label()))
+        .unwrap_or_else(|| "—".to_string());
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!(" {selected_label} "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "live tailing · refresh 5 s · events ring 50 k",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    f.render_widget(footer, chunks[2]);
+}
+
+fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut block_starts: Vec<usize> = Vec::new();
+    for (idx, session) in dash.sessions.iter().enumerate() {
+        block_starts.push(lines.len());
+        push_block(&mut lines, dash, session, idx, inner_w);
+    }
+    (lines, block_starts)
+}
+
+fn push_block(
+    lines: &mut Vec<Line<'static>>,
+    dash: &Dashboard,
+    s: &DiscoveredSession,
+    idx: usize,
+    inner_w: usize,
+) {
+    let marker = if idx == dash.selected { "▶ " } else { "  " };
+    let accent = agent_color(s.agent);
+
+    let worktree = s
+        .worktree
+        .as_ref()
+        .map(|p| shorten_path(p, inner_w))
+        .unwrap_or_else(|| s.path.to_string_lossy().to_string());
+    let branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
+    let task = s.task.clone().unwrap_or_default();
+    let task_trim = truncate(&task, inner_w.saturating_sub(20));
+    let node_count = s.node_count_proxy;
+    let modified = s
+        .modified
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| format_relative(d.as_secs()))
+        .unwrap_or_else(|| "?".into());
+
+    lines.push(Line::from(vec![
+        Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} ", s.agent.icon()),
+            Style::default().fg(accent),
+        ),
+        Span::styled(
+            format!("{:<11}", s.agent.label()),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(worktree, Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(
+            format!("⏵ {branch}"),
+            Style::default().fg(accent),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{node_count} nodes"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("  "),
+        Span::styled(modified, Style::default().fg(Color::DarkGray)),
+    ]));
+
+    if !task_trim.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  └ task: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(task_trim, Style::default().fg(Color::Gray)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  └ task: <empty>",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if idx == dash.selected {
+        lines.push(Line::from(Span::styled(
+            "  ── execution graph ──",
+            Style::default().fg(accent),
+        )));
+        if let Some(tail) = dash.tails.get(&s.path) {
+            if let Some(err) = &tail.last_error {
+                lines.push(Line::from(vec![
+                    Span::styled("    ⚠ ", Style::default().fg(Color::Red)),
+                    Span::styled(err.clone(), Style::default().fg(Color::Red)),
+                ]));
+            }
+            // Last 12 rows, newest first.
+            let recent: Vec<&Node> = tail.tree.rows.iter().rev().take(12).collect();
+            for n in recent.iter().rev() {
+                lines.push(render_dashboard_row(n, accent));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "    (no tail state yet)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+}
+
+fn render_dashboard_row(n: &Node, accent: Color) -> Line<'static> {
+    let prefix = if n.depth == 0 { "    " } else { "      └─ " };
+    let (kind_label, kind_color) = match &n.kind {
+        NodeKind::UserText(_) => ("user".to_string(), Color::Cyan),
+        NodeKind::AssistantText(_) => ("assistant".to_string(), Color::Magenta),
+        NodeKind::ToolCall { name, .. } => (format!("tool {name}"), accent),
+        NodeKind::ToolResult(_) => ("result".to_string(), Color::Blue),
+        NodeKind::Unknown(_) => ("?".to_string(), Color::Red),
+    };
+    let body: String = match &n.kind {
+        NodeKind::UserText(t)
+        | NodeKind::AssistantText(t)
+        | NodeKind::ToolResult(t)
+        | NodeKind::Unknown(t) => truncate(t, 70),
+        NodeKind::ToolCall { input, .. } => truncate(input, 70),
+    };
+    let (status_glyph, status_color) = match n.status {
+        Status::Pending => ("  …", Color::Yellow),
+        Status::Done => ("  ✓", Color::Green),
+        Status::Failed => ("  ✗", Color::Red),
+    };
+    Line::from(vec![
+        Span::raw(prefix.to_string()),
+        Span::styled(
+            format!("{kind_label:<18} "),
+            Style::default().fg(kind_color),
+        ),
+        Span::raw(body),
+        Span::styled(status_glyph, Style::default().fg(status_color)),
+    ])
+}
+
+fn agent_color(kind: AgentKind) -> Color {
+    match kind {
+        AgentKind::ClaudeCode => Color::Cyan,
+        AgentKind::Codex => Color::Magenta,
+        AgentKind::MiniMax => Color::Yellow,
+        AgentKind::Gemini => Color::Green,
+        AgentKind::Unknown => Color::DarkGray,
+    }
+}
+
+fn shorten_path(p: &Path, max: usize) -> String {
+    let s = p.to_string_lossy().to_string();
+    if s.chars().count() <= max {
+        return s;
+    }
+    let total = s.chars().count();
+    let keep: String = s
+        .chars()
+        .skip(total.saturating_sub(max.saturating_sub(2)))
+        .collect();
+    format!("…/{keep}")
+}
+
+fn format_relative(secs_since_epoch: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delta = now.saturating_sub(secs_since_epoch);
+    if delta < 60 {
+        format!("{delta}s ago")
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86_400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86_400)
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+fn compute_scroll(selected_start: Option<usize>, total: usize, viewport: usize) -> usize {
+    let Some(start) = selected_start else {
+        return 0;
+    };
+    if total <= viewport {
+        return 0;
+    }
+    let end_estimate = start + viewport.saturating_sub(1);
+    if end_estimate <= total {
+        0
+    } else {
+        total.saturating_sub(viewport)
+    }
+}
+
+/// App loop for dashboard mode: rediscovery + tails + keyboard.
+pub fn run<B: Backend>(term: &mut Terminal<B>, mut dash: Dashboard) -> std::io::Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
+
+    // Auto-load the initially selected session so its graph is shown on the
+    // first frame.
+    dash.ensure_loaded(dash.selected);
+
+    let mut last_draw = Instant::now();
+    loop {
+        dash.tick_discovery();
+        dash.tick_tails();
+
+        if last_draw.elapsed() >= Duration::from_millis(33) {
+            term.draw(|f| draw(f, &dash))?;
+            last_draw = Instant::now();
+        }
+
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind == KeyEventKind::Press && handle_key(k, &mut dash) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_key(k: crossterm::event::KeyEvent, dash: &mut Dashboard) -> bool {
+    match k.code {
+        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Char('j') | KeyCode::Down => {
+            dash.move_selection(1);
+            false
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            dash.move_selection(-1);
+            false
+        }
+        KeyCode::Char('g') => {
+            dash.selected = 0;
+            false
+        }
+        KeyCode::Char('G') => {
+            if !dash.sessions.is_empty() {
+                dash.selected = dash.sessions.len() - 1;
+            }
+            false
+        }
+        KeyCode::Char('r') => {
+            // Force rediscovery.
+            dash.last_discovery = Duration::from_secs(99 * 60 * 60).into_std_instant();
+            false
+        }
+        _ => false,
+    }
+}
+
+trait IntoStdInstant {
+    fn into_std_instant(self) -> Instant;
+}
+impl IntoStdInstant for Duration {
+    fn into_std_instant(self) -> Instant {
+        Instant::now()
+            .checked_sub(self)
+            .unwrap_or_else(Instant::now)
+    }
+}

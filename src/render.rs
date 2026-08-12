@@ -1,4 +1,5 @@
-//! Rendering: TUI frame + plain text fallback. Hand-rolled unicode; no graph-layout crate.
+//! Single-session rendering: TUI frame + plain text fallback. Hand-rolled
+//! unicode; no graph-layout crate.
 
 use std::io::Write;
 
@@ -103,7 +104,6 @@ fn render_row(n: &Node) -> Line<'static> {
 }
 
 fn short_ts(ts: &str) -> &str {
-    // ISO-8601 → hh:mm:ss
     if ts.len() >= 19 {
         &ts[11..19]
     } else {
