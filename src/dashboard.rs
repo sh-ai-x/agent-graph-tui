@@ -472,7 +472,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     // Top level (nav_path=[]): show every repo in the session list, even
     // ones with no recent sessions, so the user can navigate.
     if dash.nav_path.is_empty() {
-        for repo in dash.all_repos() {
+        for (i, repo) in dash.all_repos().into_iter().enumerate() {
             let total = count_for_repo_unfiltered(dash, &repo);
             let recent = dash
                 .sessions
@@ -486,7 +486,10 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
             } else {
                 format!("  ({} sessions)", total)
             };
+            // Marker on the focused repo only.
+            let marker = if i == dash.selected { "▶ " } else { "  " };
             lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("📁 "),
                 Span::styled(
                     format!("{:<22}", repo),
@@ -548,8 +551,11 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
         if last_branch.as_deref() != Some(branch_disp.as_str()) {
             let indent = if last_agent.is_some() { "    " } else { "  " };
+            // Marker on the focused branch.
+            let marker = if position == dash.selected { "▶ " } else { "  " };
             lines.push(Line::from(vec![
-                Span::raw(indent),
+                Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(if marker == "▶ " { "" } else { indent.trim_start() }),
                 Span::styled(format!("⏵ {branch_disp}"), Style::default().fg(Color::White)),
             ]));
             last_branch = Some(branch_disp);
