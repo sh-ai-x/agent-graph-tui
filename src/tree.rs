@@ -99,10 +99,7 @@ pub fn session_status(
 pub enum NodeKind {
     UserText(String),
     AssistantText(String),
-    ToolCall {
-        name: String,
-        input: String,
-    },
+    ToolCall { name: String, input: String },
     ToolResult(String),
     Unknown(String),
 }
@@ -164,7 +161,12 @@ impl Session {
                 status: Status::Done,
                 ts: ts.clone(),
             }),
-            Event::ToolCall { ts, id, name, input } => {
+            Event::ToolCall {
+                ts,
+                id,
+                name,
+                input,
+            } => {
                 let idx = self.rows.len();
                 self.rows.push(Node {
                     depth: 0,
@@ -177,7 +179,12 @@ impl Session {
                 });
                 self.pending_tools.insert(id.clone(), idx);
             }
-            Event::ToolResult { ts, tool_use_id, output, is_error } => {
+            Event::ToolResult {
+                ts,
+                tool_use_id,
+                output,
+                is_error,
+            } => {
                 if let Some(&parent_idx) = self.pending_tools.get(tool_use_id) {
                     self.rows[parent_idx].status = if *is_error {
                         Status::Failed
@@ -188,7 +195,11 @@ impl Session {
                 self.rows.push(Node {
                     depth: 1,
                     kind: NodeKind::ToolResult(output.clone()),
-                    status: if *is_error { Status::Failed } else { Status::Done },
+                    status: if *is_error {
+                        Status::Failed
+                    } else {
+                        Status::Done
+                    },
                     ts: ts.clone(),
                 });
             }
@@ -360,8 +371,7 @@ mod tests {
     #[test]
     fn session_status_pending_with_recent_mtime_is_running() {
         let rows = vec![row_with_status(Status::Pending, 0)];
-        let recent = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(5);
+        let recent = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
         assert_eq!(session_status(&rows, Some(recent)), SessionStatus::Running);
     }
 
