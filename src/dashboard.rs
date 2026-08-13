@@ -178,6 +178,40 @@ impl Dashboard {
         repos.dedup();
         repos
     }
+
+    /// Count currently-running sessions in a repo.
+    fn running_in_repo(&self, repo: &str) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.repo_name.as_deref() == Some(repo))
+            .filter(|s| self.is_running(s))
+            .count()
+    }
+
+    /// Auto-drill into the first Running session on startup, so the
+    /// user lands on the live activity. Returns true if we drilled in.
+    pub fn focus_first_running(&mut self) -> bool {
+        for (i, s) in self.sessions.iter().enumerate() {
+            if self.is_running(s) {
+                if let Some(repo) = s.repo_name.as_ref() {
+                    self.nav_path = vec![repo.clone()];
+                    if let Some(branch) = s.branch.as_ref() {
+                        self.nav_path.push(branch.clone());
+                    }
+                    // selected is the position within nav_items(), which
+                    // is the same ordering as the session list filtered by
+                    // nav_path. Find the index of this session.
+                    self.selected = self
+                        .nav_items()
+                        .iter()
+                        .position(|item| matches!(item, NavItem::Session(j) if *j == i))
+                        .unwrap_or(0);
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// Open the parser and build the initial tree for a session; idempotent.
     pub fn load_tail(&mut self, path: &Path) -> bool {
         let needs_load = self
@@ -504,7 +538,9 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut group_tops: Vec<usize> = Vec::new();
 
     // Top level (nav_path=[]): show every repo in the session list, even
-    // ones with no recent sessions, so the user can navigate.
+    // ones with no recent sessions, so the user can navigate. Add a `●`
+    // marker on each repo that has at least one Running session so the
+    // user can see at a glance which projects have live activity.
     if dash.nav_path.is_empty() {
         for (i, repo) in dash.all_repos().into_iter().enumerate() {
             let total = count_for_repo_unfiltered(dash, &repo);
@@ -514,11 +550,17 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                 .filter(|s| s.repo_name.as_deref() == Some(repo.as_str()))
                 .filter(|s| dash.session_visible(s))
                 .count();
+            let running = dash.running_in_repo(&repo);
             current_group_top_holder(&mut lines, &mut block_starts, &mut group_tops);
-            let label = if recent < total {
+            let count_label = if recent < total {
                 format!("  ({} recent / {} total)", recent, total)
             } else {
                 format!("  ({} sessions)", total)
+            };
+            let running_label = if running > 0 {
+                format!("  [● {} running]", running)
+            } else {
+                String::new()
             };
             // Marker on the focused repo only.
             let marker = if i == dash.selected { "▶ " } else { "  " };
@@ -529,7 +571,8 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                     format!("{:<22}", repo),
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(label, Style::default().fg(Color::DarkGray)),
+                Span::styled(count_label, Style::default().fg(Color::DarkGray)),
+                Span::styled(running_label, Style::default().fg(Color::Cyan)),
             ]));
         }
         return (lines, block_starts, group_tops);
@@ -1060,6 +1103,13 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut dash: Dashboard) -> std::io::
     // are visible in the Sessions view on first paint.
     dash.ensure_loaded(dash.selected);
     dash.autoload_running();
+
+    // If anything is currently Running, auto-drill into the first one
+    // so the user lands on the live activity without having to navigate.
+    // Otherwise stay at the Repos view.
+    if !dash.focus_first_running() {
+        // nav_path already empty; nothing to do.
+    }
 
     let mut last_draw = Instant::now();
     loop {
