@@ -260,6 +260,16 @@ impl Dashboard {
         for s in &snapshot {
             self.ensure_tail(s);
         }
+        // Newly visible sessions that haven't been loaded yet need their
+        // tail parsed so the real status is determined. Without this, a
+        // brand-new session stays at `quick_status` = Done (no events
+        // yet), and the user wouldn't see it as Running until they
+        // navigate to it.
+        for s in &snapshot {
+            if self.session_visible(s) {
+                self.load_tail(&s.path);
+            }
+        }
         if self.selected >= self.nav_items().len() {
             self.selected = self.nav_items().len().saturating_sub(1);
         }
