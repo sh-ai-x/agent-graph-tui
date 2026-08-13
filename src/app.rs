@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::Terminal;
 
 use crate::parser::Session as ParseSession;
 use crate::render;

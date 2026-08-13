@@ -345,7 +345,8 @@ mod tests {
         let path = std::env::temp_dir().join("agent-graph-tui-test-crlf.jsonl");
         let _ = std::fs::remove_file(&path);
         let line1 = br#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"t0"}"#;
-        let line2 = br#"{"type":"user","message":{"role":"user","content":"there"},"timestamp":"t1"}"#;
+        let line2 =
+            br#"{"type":"user","message":{"role":"user","content":"there"},"timestamp":"t1"}"#;
         let mut body = Vec::new();
         body.extend_from_slice(line1);
         body.extend_from_slice(b"\r\n");
@@ -428,7 +429,10 @@ mod tests {
             events: Vec::new(),
         };
         let outcome = s.rescan_from(0).unwrap();
-        assert!(outcome.rebuilt, "ring-cap eviction from initial parse still flags rebuild");
+        assert!(
+            outcome.rebuilt,
+            "ring-cap eviction from initial parse still flags rebuild"
+        );
         assert_eq!(s.events.len(), super::MAX_EVENTS, "ring cap applied");
         let _ = std::fs::remove_file(&path);
     }

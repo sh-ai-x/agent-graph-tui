@@ -15,13 +15,11 @@ pub fn draw(f: &mut Frame, s: &Session, selected: usize, scroll: usize, path: &s
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ],
-        )
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let header = Paragraph::new(Line::from(vec![
@@ -57,9 +55,7 @@ pub fn draw(f: &mut Frame, s: &Session, selected: usize, scroll: usize, path: &s
 
     let total = s.rows.len();
     let shown = total.saturating_sub(scroll);
-    let footer = Paragraph::new(format!(
-        " {shown}/{total}   ↑↓ navigate   q quit "
-    ));
+    let footer = Paragraph::new(format!(" {shown}/{total}   ↑↓ navigate   q quit "));
     f.render_widget(footer, chunks[2]);
 }
 

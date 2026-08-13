@@ -132,9 +132,7 @@ pub fn discover() -> DiscoveryReport {
         }
     }
 
-    report
-        .sessions
-        .sort_by(|a, b| b.modified.cmp(&a.modified));
+    report.sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     report.sessions.truncate(MAX_SESSIONS);
 
     // Phase 2: enrich the survivors with git-derived info (one git fork per
@@ -196,7 +194,8 @@ mod repo_root_tests {
     #[test]
     fn git_repo_root_resolves_a_worktree_to_its_main_repo() {
         // Setup: a worktree of `main` at `.worktrees/skill-chain-redesign`.
-        let dir = std::env::temp_dir().join(format!("agent-graph-tui-rroot-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-graph-tui-rroot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let main_repo = dir.join("main");
         let wt = main_repo.join(".worktrees").join("skill-chain-redesign");
@@ -208,17 +207,29 @@ mod repo_root_tests {
             .args(["init", "--initial-branch=main"])
             .output()
             .unwrap();
-        run(&format!("git -C {} worktree add .worktrees/skill-chain-redesign -b skill-chain-redesign", main_repo.display()));
+        run(&format!(
+            "git -C {} worktree add .worktrees/skill-chain-redesign -b skill-chain-redesign",
+            main_repo.display()
+        ));
         std::process::Command::new("git")
             .arg("-C")
             .arg(&main_repo)
-            .args(["worktree", "add", ".worktrees/skill-chain-redesign", "-b", "skill-chain-redesign"])
+            .args([
+                "worktree",
+                "add",
+                ".worktrees/skill-chain-redesign",
+                "-b",
+                "skill-chain-redesign",
+            ])
             .output()
             .unwrap();
         let resolved = git_repo_root(&wt).expect("should resolve");
         // We expect basename = `main`, NOT `skill-chain-redesign`.
         assert_eq!(
-            resolved.file_name().map(|n| n.to_string_lossy().to_string()).as_deref(),
+            resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .as_deref(),
             Some("main"),
             "worktree toplevel should resolve to the main repo, got {:?}",
             resolved
@@ -387,10 +398,7 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
     let mut buf = Vec::with_capacity((len - seek_to) as usize);
     let _ = f.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf);
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     for line in lines.iter().rev() {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -402,10 +410,7 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
                 let content = v.get("message").and_then(|m| m.get("content"));
                 if let Some(arr) = content.and_then(|c| c.as_array()) {
                     for block in arr {
-                        let btype = block
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
+                        let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         // The agent is actively working. tool_use means
                         // it's blocked on a tool result; thinking /
                         // redacted_thinking mean it's still reasoning.
@@ -434,11 +439,7 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
                     .and_then(|c| c.as_array())
                 {
                     for block in arr {
-                        if block
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            == Some(true)
-                        {
+                        if block.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
                             return tree::SessionStatus::Failed;
                         }
                     }
@@ -619,7 +620,7 @@ mod tests {
         assert!(name.is_none());
     }
 
-      #[test]
+    #[test]
     fn extract_model_picks_up_message_model_field() {
         let path = write_temp_jsonl(
             "claude_code",

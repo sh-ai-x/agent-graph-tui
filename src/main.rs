@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use agent_graph_tui::{app, dashboard, discovery, parser, render, tree};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -139,18 +139,28 @@ fn run_dashboard(started: Instant) -> ExitCode {
         let mut last_branch: Option<String> = None;
         for &idx in &sorted {
             let s = &dash.sessions[idx];
-            let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
+            let repo_disp = s
+                .repo_name
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_string());
             if last_repo.as_deref() != Some(repo_disp.as_str()) {
                 let _ = writeln!(lock, "\n  {repo_disp}");
                 last_repo = Some(repo_disp);
                 last_branch = None;
             }
-            let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
+            let branch_disp = s
+                .branch
+                .clone()
+                .unwrap_or_else(|| "<no branch>".to_string());
             if last_branch.as_deref() != Some(branch_disp.as_str()) {
                 let _ = writeln!(lock, "    ⏵ {branch_disp}");
                 last_branch = Some(branch_disp);
             }
-            let status = dash.tails.get(&s.path).map(|t| t.status).unwrap_or(s.quick_status);
+            let status = dash
+                .tails
+                .get(&s.path)
+                .map(|t| t.status)
+                .unwrap_or(s.quick_status);
             let model = s.model.clone().unwrap_or_else(|| "<unknown>".into());
             let _ = writeln!(
                 lock,

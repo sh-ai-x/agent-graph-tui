@@ -5,16 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use ratatui::Terminal;
 
-use crate::discovery::{AgentKind, DiscoveryReport, DiscoveredSession};
-use crate::tree::{Node, NodeKind, SessionStatus, Status, session_status};
+use crate::discovery::{AgentKind, DiscoveredSession, DiscoveryReport};
+use crate::tree::{session_status, Node, NodeKind, SessionStatus, Status};
 use crate::{parser, tree};
 
 const MAX_SESSIONS: usize = 32;
@@ -89,7 +89,9 @@ impl Dashboard {
         let consumed = p.events.len();
         let offset = std::fs::metadata(&p.path).map(|m| m.len()).unwrap_or(0);
         let tree = tree::Session::build(&p);
-        let modified = std::fs::metadata(&p.path).ok().and_then(|m| m.modified().ok());
+        let modified = std::fs::metadata(&p.path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let status = session_status(&tree.rows, modified);
         TailState {
             parser: Some(p),
@@ -229,11 +231,7 @@ impl Dashboard {
     }
     /// Open the parser and build the initial tree for a session; idempotent.
     pub fn load_tail(&mut self, path: &Path) -> bool {
-        let needs_load = self
-            .tails
-            .get(path)
-            .map(|t| !t.loaded)
-            .unwrap_or(true);
+        let needs_load = self.tails.get(path).map(|t| !t.loaded).unwrap_or(true);
         if !needs_load {
             return false;
         }
@@ -308,7 +306,9 @@ impl Dashboard {
             .iter()
             .filter(|(path, tail)| {
                 !tail.loaded
-                    && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+                    && std::fs::metadata(path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
             })
             .map(|(path, _)| path.clone())
             .collect();
@@ -375,7 +375,8 @@ impl Dashboard {
     }
 
     pub fn selected_tail(&self) -> Option<&TailState> {
-        self.selected_session().and_then(|s| self.tails.get(&s.path))
+        self.selected_session()
+            .and_then(|s| self.tails.get(&s.path))
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -563,18 +564,27 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
     // Footer
     let selected_label = dash
         .selected_session()
-        .map(|s| format!("{}/{} · {}", dash.selected + 1, dash.sessions.len(), s.agent.label()))
+        .map(|s| {
+            format!(
+                "{}/{} · {}",
+                dash.selected + 1,
+                dash.sessions.len(),
+                s.agent.label()
+            )
+        })
         .unwrap_or_else(|| "—".to_string());
-    let filter_label = if dash.recent_only { "all" } else { "active only" };
+    let filter_label = if dash.recent_only {
+        "all"
+    } else {
+        "active only"
+    };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {selected_label} "),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                "  ⏎ drill-down · ⌫ drill-up · f filter ({filter_label}) · r refresh · q quit"
-            ),
+            format!("  ⏎ drill-down · ⌫ drill-up · f filter ({filter_label}) · r refresh · q quit"),
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -632,11 +642,16 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
             // Marker on the focused repo only.
             let marker = if i == dash.selected { "▶ " } else { "  " };
             lines.push(Line::from(vec![
-                Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    marker.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("📁 "),
                 Span::styled(
                     format!("{:<22}", repo),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(count_label, Style::default().fg(Color::DarkGray)),
                 Span::styled(running_label, Style::default().fg(Color::Cyan)),
@@ -692,15 +707,32 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         let s = &dash.sessions[idx];
 
         // Branch sub-group — always shown.
-        let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
+        let branch_disp = s
+            .branch
+            .clone()
+            .unwrap_or_else(|| "<no branch>".to_string());
         if last_branch.as_deref() != Some(branch_disp.as_str()) {
             let indent = if last_agent.is_some() { "    " } else { "  " };
             // Marker on the focused branch.
-            let marker = if position == dash.selected { "▶ " } else { "  " };
+            let marker = if position == dash.selected {
+                "▶ "
+            } else {
+                "  "
+            };
             lines.push(Line::from(vec![
-                Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(if marker == "▶ " { "" } else { indent.trim_start() }),
-                Span::styled(format!("⏵ {branch_disp}"), Style::default().fg(Color::White)),
+                Span::styled(
+                    marker.to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(if marker == "▶ " {
+                    ""
+                } else {
+                    indent.trim_start()
+                }),
+                Span::styled(
+                    format!("⏵ {branch_disp}"),
+                    Style::default().fg(Color::White),
+                ),
             ]));
             last_branch = Some(branch_disp);
         }
@@ -717,7 +749,8 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     (lines, block_starts, group_tops)
 }
 
-fn current_group_top_holder(_l: &mut Vec<Line<'static>>, _b: &mut Vec<usize>, _g: &mut Vec<usize>) {}
+fn current_group_top_holder(_l: &mut Vec<Line<'static>>, _b: &mut Vec<usize>, _g: &mut Vec<usize>) {
+}
 
 fn count_for_repo_unfiltered(dash: &Dashboard, repo: &str) -> usize {
     dash.sessions
@@ -748,8 +781,16 @@ fn push_session(
     // `position` is the index within the current nav scope (after the
     // recency + nav_path filters), not the global session index. That
     // matches `dash.selected` (= nav_index).
-    let marker = if position == dash.selected { "▶ " } else { "  " };
-    let status = dash.tails.get(&s.path).map(|t| t.status).unwrap_or(crate::tree::SessionStatus::Done);
+    let marker = if position == dash.selected {
+        "▶ "
+    } else {
+        "  "
+    };
+    let status = dash
+        .tails
+        .get(&s.path)
+        .map(|t| t.status)
+        .unwrap_or(crate::tree::SessionStatus::Done);
     let status_color = status.color();
 
     let _branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
@@ -767,9 +808,14 @@ fn push_session(
             Span::raw("      "),
             Span::styled(
                 format!("[{}] ", status.glyph()),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(marker.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                marker.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ];
         if let Some(model) = &s.model {
             spans.push(Span::styled(
@@ -826,7 +872,11 @@ fn push_session(
 }
 
 fn render_dashboard_row(n: &Node, accent: Color) -> Line<'static> {
-    let prefix = if n.depth == 0 { "    " } else { "      └─ " };
+    let prefix = if n.depth == 0 {
+        "    "
+    } else {
+        "      └─ "
+    };
     let (kind_label, kind_color) = match &n.kind {
         NodeKind::UserText(_) => ("user".to_string(), Color::Cyan),
         NodeKind::AssistantText(_) => ("assistant".to_string(), Color::Magenta),
