@@ -406,13 +406,17 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
-                        if btype == "tool_use" {
-                            // The agent just made a tool_use call and is
-                            // waiting for the result.
+                        // The agent is actively working. tool_use means
+                        // it's blocked on a tool result; thinking /
+                        // redacted_thinking mean it's still reasoning.
+                        if btype == "tool_use"
+                            || btype == "thinking"
+                            || btype == "redacted_thinking"
+                        {
                             return tree::SessionStatus::Running;
                         }
                         if btype == "text" {
-                            // The agent's last event was a plain text
+                            // The agent's last block was a plain text
                             // reply — conversation is paused.
                             return tree::SessionStatus::Done;
                         }
@@ -709,6 +713,30 @@ mod tests {
         );
         let s = super::quick_status(&path);
         assert_eq!(s, tree::SessionStatus::Done);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_assistant_thinking_block_is_running() {
+        let path = write_temp_jsonl(
+            "assistant_thinking",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"text\":\"...\"}]}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_assistant_redacted_thinking_is_running() {
+        let path = write_temp_jsonl(
+            "assistant_redacted",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"redacted_thinking\"}]}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
         let _ = std::fs::remove_file(&path);
     }
 
