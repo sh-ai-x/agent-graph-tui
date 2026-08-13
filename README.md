@@ -11,22 +11,58 @@ Read-only. No daemon. No server. No electron. ~0.7 MB binary, cold start
 
 ```
 $ agent-graph-tui           # multi-session dashboard (default)
+$ agent-graph-tui </dev/null
+agent-graph-tui — 2 of 32 sessions visible (text mode, cold start 1844.47 ms)
 
-agent-graph-tui  32 active sessions  ·  ↑/↓ select   ⏎ expand   q quit
-─────────────────────────────────────────────────────────────────
-🤖 claude-code (32 sessions)
-  agent-graph-tui                              ← git main-repo
-    ⏵ main                                     ← worktree branch
-      ▶ [o] MiniMax-M3              23 nodes    55s ago
-      ☒ [o] <unknown>                0 nodes     2h ago
-      ☒ [o] <unknown>                0 nodes     2h ago
-  archidraw
+  agent-graph-tui
     ⏵ main
-      ☒ [o] MiniMax-M3              33 nodes
+      [○] MiniMax-M3              23 nodes
+
   dev-harness-kit
-    ⏵ agent/harness-effectiveness
-      ☒ [o] <unknown>               17 nodes
-      ☒ [o] MiniMax-M3              25 nodes
+    ⏵ main
+      [○] MiniMax-M3              22 nodes
+```
+
+The TUI itself (`agent-graph-tui` on a TTY) replaces the
+`[○] MiniMax-M3 ...` rows with the cyan-filled `●` glyph when the
+session is currently running, with the execution graph rendered
+inline beneath. The `f` key toggles between "active only" and
+"show all"; the auto-discovery on startup drills directly into the
+first running session.
+
+```
+$ agent-graph-tui fixtures/sample.jsonl
+10:00:00 user      fix the parser bug ✓
+10:00:01 assistant I'll read the parser first. ✓
+10:00:02 tool      Read {"path":"/Users/sanghee/dev/agent-graph-tui/.worktrees/agent-graph-viewer/src/pa… ✓
+10:00:03     └─ result    // truncated file contents... ✓
+10:00:04 assistant Now editing the parser to fix the truncate off-by-one. ✓
+10:00:05 tool      Edit {"path":"/Users/sanghee/dev/agent-graph-tui/.worktrees/agent-graph-viewer/src/pa… ✓
+10:00:06     └─ result    ok ✓
+10:00:07 assistant Done. Let me verify with cargo test. ✓
+
+8 rows
+cold start: 3.23 ms (single mode)
+```
+
+Plain-text mode (no TTY) — same data, no interactive rendering.
+The session-count header and per-session lines are emitted to stdout
+and the program exits. Useful for CI logs or `tee` recordings.
+
+The text-mode output uses the same status glyphs as the TUI: `○`
+empty = Done, `●` filled (cyan) = Running, `✗` (red) = Failed,
+`?` (yellow) = Blocked. Sessions older than 1 h are hidden by
+default — the recent_only filter; press `f` in the TUI to see all
+32.
+
+The cyan `●` glyph marks each running session, the empty `○` marks
+Done. If everything is Done and the recency filter is on, the
+dashboard prints a hint instead of an empty list:
+
+```
+agent-graph-tui — 0 of 32 sessions visible (text mode, cold start 4.0 s)
+
+(no active sessions — all 32 are Done. The TUI `f` key toggles show-done.)
 ```
 
 ---
