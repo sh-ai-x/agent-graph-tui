@@ -539,7 +539,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
 
     let mut last_agent: Option<AgentKind> = None;
     let mut last_branch: Option<String> = None;
-    let mut current_group_top: usize = 0;
+    let current_group_top: usize = 0;
 
     for &idx in &sorted {
         let s = &dash.sessions[idx];
