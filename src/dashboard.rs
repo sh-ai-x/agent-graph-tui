@@ -132,9 +132,16 @@ impl Dashboard {
 
     /// Whether a session should be visible given the current `recent_only`
     /// filter. Sessions modified within `RECENT_MINUTES` are recent;
-    /// older sessions are hidden by default.
+    /// older sessions are hidden by default. **Running** sessions (live
+    /// agent activity) are always visible regardless of recency — the user
+    /// wants to see what's currently working, not just what was touched
+    /// recently.
     pub fn session_visible(&self, s: &DiscoveredSession) -> bool {
         if !self.recent_only {
+            return true;
+        }
+        // Live activity always wins over the recency filter.
+        if self.is_running(s) {
             return true;
         }
         match s.modified {
@@ -144,6 +151,18 @@ impl Dashboard {
                 .unwrap_or(false),
             None => false,
         }
+    }
+
+    /// Whether a session is currently in `Running` state, using the loaded
+    /// tail status if available and falling back to the cheap `quick_status`
+    /// probe (last event of the JSONL).
+    pub fn is_running(&self, s: &DiscoveredSession) -> bool {
+        let status = self
+            .tails
+            .get(&s.path)
+            .map(|t| t.status)
+            .unwrap_or(s.quick_status);
+        matches!(status, crate::tree::SessionStatus::Running)
     }
 
     /// All repos in the session list, sorted alphabetically. Used at the
@@ -246,6 +265,21 @@ impl Dashboard {
             // Recompute session-level status from the latest tree rows.
             let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
             tail.status = session_status(&tail.tree.rows, modified);
+        }
+    }
+
+    /// Pre-load the tail of every session that is currently Running, so
+    /// their execution graphs are visible on first paint of the Sessions
+    /// view. Cheap — the parser is lazy; we just kick off the load.
+    pub fn autoload_running(&mut self) {
+        let recent_running: Vec<PathBuf> = self
+            .sessions
+            .iter()
+            .filter(|s| self.is_running(s))
+            .map(|s| s.path.clone())
+            .collect();
+        for path in recent_running {
+            self.load_tail(&path);
         }
     }
 
@@ -1022,8 +1056,10 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut dash: Dashboard) -> std::io::
     )?;
 
     // Auto-load the initially selected session so its graph is shown on the
-    // first frame.
+    // first frame. Also pre-load any currently-Running sessions so they
+    // are visible in the Sessions view on first paint.
     dash.ensure_loaded(dash.selected);
+    dash.autoload_running();
 
     let mut last_draw = Instant::now();
     loop {
