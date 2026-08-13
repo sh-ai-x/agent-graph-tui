@@ -366,12 +366,13 @@ fn extract_cwd(head: &str) -> Option<PathBuf> {
     None
 }
 
-/// Quick session-status check by reading the FILE'S LAST event from the tail
-/// of the JSONL. Avoids parsing the entire file. Returns:
-///   - `Running` if the last event is a `tool_use` (no matching result yet).
-///   - `Failed` if the last event is a `tool_result` with `is_error=true`.
-///   - `Done`   otherwise (last event is a user message → either Blocked-on-user
-///               or fully done; we don't distinguish here).
+/// Quick session-status check by reading the FILE'S LAST 64 KiB and walking
+/// lines from the end. Avoids parsing the entire file. Returns:
+///   - `Failed`   if the most recent `tool_result` has `is_error=true`.
+///   - `Running`  if the most recent event is an assistant `tool_use`
+///                (no matching `tool_result` yet) or a user message
+///                (agent hasn't produced a response yet).
+///   - `Done`     otherwise (last assistant event was a text reply).
 pub fn quick_status(path: &Path) -> tree::SessionStatus {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -381,51 +382,67 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
     if len == 0 {
         return tree::SessionStatus::Done;
     }
-    // Read the last 8 KiB; drop the partial last line.
-    let seek_to = len.saturating_sub(8 * 1024);
+    let seek_to = len.saturating_sub(64 * 1024);
     let _ = f.seek(SeekFrom::Start(seek_to));
     let mut buf = Vec::with_capacity((len - seek_to) as usize);
     let _ = f.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf);
-    let last_line = text
+    let lines: Vec<&str> = text
         .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
-    let v: serde_json::Value = match serde_json::from_str(last_line) {
-        Ok(v) => v,
-        Err(_) => return tree::SessionStatus::Done,
-    };
-    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if ty == "assistant" {
-        // Has any tool_use without matching tool_result in the buffered tail?
-        let content = v.get("message").and_then(|m| m.get("content"));
-        if let Some(arr) = content.and_then(|c| c.as_array()) {
-            for block in arr {
-                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    return tree::SessionStatus::Running;
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    for line in lines.iter().rev() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "assistant" => {
+                let content = v.get("message").and_then(|m| m.get("content"));
+                if let Some(arr) = content.and_then(|c| c.as_array()) {
+                    for block in arr {
+                        let btype = block
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        if btype == "tool_use" {
+                            // The agent just made a tool_use call and is
+                            // waiting for the result.
+                            return tree::SessionStatus::Running;
+                        }
+                        if btype == "text" {
+                            // The agent's last event was a plain text
+                            // reply — conversation is paused.
+                            return tree::SessionStatus::Done;
+                        }
+                    }
                 }
+                return tree::SessionStatus::Done;
             }
-        }
-        return tree::SessionStatus::Done;
-    }
-    if ty == "user" {
-        let content = v.get("message").and_then(|m| m.get("content"));
-        if let Some(arr) = content.and_then(|c| c.as_array()) {
-            for block in arr {
-                if block.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
-                    return tree::SessionStatus::Failed;
+            "user" => {
+                // Any user event means the agent hasn't produced its
+                // next response yet — either plain text (agent thinking)
+                // or tool_result (agent processing the result).
+                if let Some(arr) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in arr {
+                        if block
+                            .get("is_error")
+                            .and_then(|v| v.as_bool())
+                            == Some(true)
+                        {
+                            return tree::SessionStatus::Failed;
+                        }
+                    }
                 }
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    return tree::SessionStatus::Running;
-                }
+                return tree::SessionStatus::Running;
             }
-        } else if content.and_then(|c| c.as_str()).is_some() {
-            // Plain text user message — the user is actively typing,
-            // so the agent is presumed to be running.
-            return tree::SessionStatus::Running;
+            _ => continue,
         }
-        return tree::SessionStatus::Done;
     }
     tree::SessionStatus::Done
 }
