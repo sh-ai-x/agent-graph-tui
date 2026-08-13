@@ -268,6 +268,8 @@ impl Dashboard {
             return;
         }
         let report = crate::discovery::discover();
+        let before: std::collections::HashSet<PathBuf> =
+            self.sessions.iter().map(|s| s.path.clone()).collect();
         self.sessions = report.sessions.into_iter().take(MAX_SESSIONS).collect();
         self.tails
             .retain(|path, _| self.sessions.iter().any(|s| &s.path == path));
@@ -288,10 +290,32 @@ impl Dashboard {
         if self.selected >= self.nav_items().len() {
             self.selected = self.nav_items().len().saturating_sub(1);
         }
+        // If a brand-new running session was just discovered, drill
+        // into it automatically so the user doesn't have to navigate.
+        if self.nav_path.is_empty() {
+            self.focus_first_running();
+        }
+        // Avoid repeatedly visiting the existing first running one.
+        let _ = before;
         self.last_discovery = Instant::now();
     }
 
     pub fn tick_tails(&mut self) {
+        // First, collect paths of unloaded tails whose file now has content,
+        // so we can load them after releasing the iter_mut borrow.
+        let to_load: Vec<PathBuf> = self
+            .tails
+            .iter()
+            .filter(|(path, tail)| {
+                !tail.loaded
+                    && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in to_load {
+            self.load_tail(&path);
+        }
+
         for (path, tail) in self.tails.iter_mut() {
             if !tail.loaded {
                 continue;
