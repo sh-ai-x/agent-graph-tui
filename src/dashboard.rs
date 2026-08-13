@@ -188,6 +188,21 @@ impl Dashboard {
             .count()
     }
 
+    /// Names of branches in `repo` that have at least one Running session.
+    /// Used by the Repos view's `[● N running: branch1, branch2]` indicator.
+    fn running_branches_in_repo(&self, repo: &str) -> Vec<String> {
+        let mut branches: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.repo_name.as_deref() == Some(repo))
+            .filter(|s| self.is_running(s))
+            .filter_map(|s| s.branch.clone())
+            .collect();
+        branches.sort();
+        branches.dedup();
+        branches
+    }
+
     /// Auto-drill into the first Running session on startup, so the
     /// user lands on the live activity. Returns true if we drilled in.
     pub fn focus_first_running(&mut self) -> bool {
@@ -550,7 +565,8 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     // Top level (nav_path=[]): show every repo in the session list, even
     // ones with no recent sessions, so the user can navigate. Add a `●`
     // marker on each repo that has at least one Running session so the
-    // user can see at a glance which projects have live activity.
+    // user can see at a glance which projects have live activity. When
+    // there are running branches, list them inline.
     if dash.nav_path.is_empty() {
         for (i, repo) in dash.all_repos().into_iter().enumerate() {
             let total = count_for_repo_unfiltered(dash, &repo);
@@ -561,6 +577,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                 .filter(|s| dash.session_visible(s))
                 .count();
             let running = dash.running_in_repo(&repo);
+            let running_branches = dash.running_branches_in_repo(&repo);
             current_group_top_holder(&mut lines, &mut block_starts, &mut group_tops);
             let count_label = if recent < total {
                 format!("  ({} recent / {} total)", recent, total)
@@ -568,7 +585,23 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
                 format!("  ({} sessions)", total)
             };
             let running_label = if running > 0 {
-                format!("  [● {} running]", running)
+                let branch_list = if running_branches.is_empty() {
+                    String::new()
+                } else if running_branches.len() <= 3 {
+                    running_branches.join(", ")
+                } else {
+                    format!(
+                        "{}, {} ({} more)",
+                        running_branches[0],
+                        running_branches[1],
+                        running_branches.len() - 2
+                    )
+                };
+                if branch_list.is_empty() {
+                    format!("  [● {} running]", running)
+                } else {
+                    format!("  [● {} running: {}]", running, branch_list)
+                }
             } else {
                 String::new()
             };
