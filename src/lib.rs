@@ -4,6 +4,8 @@
 //! `tests/*.rs` can `use agent_graph_tui::parser::*` etc.
 
 pub mod app;
+pub mod dashboard;
+pub mod discovery;
 pub mod parser;
 pub mod render;
 pub mod tree;
