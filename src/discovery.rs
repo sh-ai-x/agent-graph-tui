@@ -143,11 +143,26 @@ pub fn discover() -> DiscoveryReport {
     // directory the user invoked `agent-graph-tui` from) when the JSONL head
     // doesn't carry `cwd`. The encoded project path is never used as cwd.
     //
-    // Skip sessions whose cwd resolves to the same repo we've already
-    // resolved — saves a git fork per worktree of the same project.
+    // Only run git for sessions modified within the last hour (assuming the
+    // default `recent_only` filter is on). The recency check here is
+    // duplicated from the dashboard filter so we don't take a dependency;
+    // 32 forks + 32 disk reads was ~9 s on the user's machine.
     let fallback_cwd = std::env::current_dir().ok();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &mut report.sessions {
+        // Skip git for sessions older than the recency cutoff — they're
+        // hidden by the default filter anyway, so a branch / repo name
+        // on them would never be displayed.
+        let is_recent = match s.modified {
+            Some(m) => m
+                .elapsed()
+                .map(|d| d.as_secs() < 60 * 60) // 1 hour
+                .unwrap_or(false),
+            None => false,
+        };
+        if !is_recent {
+            continue;
+        }
         let cwd = s.cwd.clone().or_else(|| fallback_cwd.clone());
         let Some(cwd) = cwd else { continue };
         if !cwd.exists() {
@@ -158,14 +173,7 @@ pub fn discover() -> DiscoveryReport {
         }
         if let Some(root) = git_repo_root(&cwd) {
             let key = root.to_string_lossy().to_string();
-            if !seen.contains(&key) {
-                s.repo_name = root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .filter(|n| !n.is_empty());
-                seen.insert(key);
-            } else {
-                // Same repo root already resolved; reuse the previous name.
+            if seen.insert(key) {
                 s.repo_name = root
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())

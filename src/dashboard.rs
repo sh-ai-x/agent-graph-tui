@@ -469,9 +469,36 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut block_starts: Vec<usize> = Vec::new();
     let mut group_tops: Vec<usize> = Vec::new();
 
-    // Filter by `recent_only`, by `nav_path` (repo / branch scope), then sort
-    // by (repo, agent, branch, modified desc) so the user sees repos as
-    // the outer group and branches within.
+    // Top level (nav_path=[]): show every repo in the session list, even
+    // ones with no recent sessions, so the user can navigate.
+    if dash.nav_path.is_empty() {
+        for repo in dash.all_repos() {
+            let total = count_for_repo_unfiltered(dash, &repo);
+            let recent = dash
+                .sessions
+                .iter()
+                .filter(|s| s.repo_name.as_deref() == Some(repo.as_str()))
+                .filter(|s| dash.session_visible(s))
+                .count();
+            current_group_top_holder(&mut lines, &mut block_starts, &mut group_tops);
+            let label = if recent < total {
+                format!("  ({} recent / {} total)", recent, total)
+            } else {
+                format!("  ({} sessions)", total)
+            };
+            lines.push(Line::from(vec![
+                Span::raw("📁 "),
+                Span::styled(
+                    format!("{:<22}", repo),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(label, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        return (lines, block_starts, group_tops);
+    }
+
+    // Inside a repo or branch: filter, sort, render with group headers.
     let mut sorted: Vec<usize> = dash
         .sessions
         .iter()
@@ -496,12 +523,10 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         let sa = &dash.sessions[a];
         let sb = &dash.sessions[b];
         let key_a = (
-            sa.repo_name.clone().unwrap_or_default(),
             agent_sort_key(sa.agent),
             sa.branch.clone().unwrap_or_default(),
         );
         let key_b = (
-            sb.repo_name.clone().unwrap_or_default(),
             agent_sort_key(sb.agent),
             sb.branch.clone().unwrap_or_default(),
         );
@@ -509,92 +534,23 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
             .0
             .cmp(&key_b.0)
             .then(key_a.1.cmp(&key_b.1))
-            .then(key_a.2.cmp(&key_b.2))
             .then(sb.modified.cmp(&sa.modified))
     });
 
-    let mut last_repo: Option<String> = None;
     let mut last_agent: Option<AgentKind> = None;
     let mut last_branch: Option<String> = None;
     let mut current_group_top: usize = 0;
-    // Track which repos have multiple agents so we only show the agent
-    // sub-group when it's actually disambiguating.
-    let mut repo_agents: std::collections::HashMap<String, std::collections::HashSet<u8>> =
-        std::collections::HashMap::new();
-    for &i in &sorted {
-        let s = &dash.sessions[i];
-        let k = s.repo_name.clone().unwrap_or_default();
-        repo_agents.entry(k).or_default().insert(agent_sort_key(s.agent));
-    }
 
     for &idx in &sorted {
         let s = &dash.sessions[idx];
 
-        // Repo header — emit on change. Always shown, since this is the
-        // top-level navigation unit. (When nav_path has 1+ elements, this
-        // only emits once at the top of the view.)
-        let repo_disp = s.repo_name.clone().unwrap_or_else(|| "<unknown>".to_string());
-        if last_repo.as_deref() != Some(repo_disp.as_str()) {
-            let total_in_repo = repo_agents
-                .get(&repo_disp)
-                .map(|_| count_for_repo_unfiltered(dash, &repo_disp))
-                .unwrap_or(0);
-            current_group_top = lines.len();
-            let crumb = if dash.nav_path.is_empty() {
-                "📁 ".to_string()
-            } else {
-                " ".repeat(dash.nav_path.len()) + "↳ "
-            };
-            lines.push(Line::from(vec![
-                Span::raw(crumb),
-                Span::styled(
-                    format!("{:<22}", repo_disp),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  ({} sessions)", total_in_repo),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            last_repo = Some(repo_disp.clone());
-            last_agent = None;
-            last_branch = None;
-        }
-
-        // Agent sub-header — only when this repo has 2+ distinct agents.
-        let show_agent = repo_agents
-            .get(&repo_disp)
-            .map(|agents| agents.len() > 1)
-            .unwrap_or(false);
-        if show_agent && last_agent != Some(s.agent) {
-            let accent = agent_color(s.agent);
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{} ", s.agent.icon()),
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    s.agent.label().to_string(),
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-            ]));
-            last_agent = Some(s.agent);
-            last_branch = None;
-        } else {
-            last_agent = Some(s.agent);
-        }
-
         // Branch sub-group — always shown.
         let branch_disp = s.branch.clone().unwrap_or_else(|| "<no branch>".to_string());
         if last_branch.as_deref() != Some(branch_disp.as_str()) {
-            let accent = if show_agent { agent_color(s.agent) } else { Color::White };
+            let indent = if last_agent.is_some() { "    " } else { "  " };
             lines.push(Line::from(vec![
-                Span::raw(if show_agent { "    " } else { "  " }),
-                Span::styled(
-                    format!("⏵ {branch_disp}"),
-                    Style::default().fg(accent),
-                ),
+                Span::raw(indent),
+                Span::styled(format!("⏵ {branch_disp}"), Style::default().fg(Color::White)),
             ]));
             last_branch = Some(branch_disp);
         }
@@ -603,9 +559,15 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         block_starts.push(lines.len());
         group_tops.push(current_group_top);
         push_session(&mut lines, dash, s, idx, inner_w, accent);
+
+        if last_agent != Some(s.agent) {
+            last_agent = Some(s.agent);
+        }
     }
     (lines, block_starts, group_tops)
 }
+
+fn current_group_top_holder(_l: &mut Vec<Line<'static>>, _b: &mut Vec<usize>, _g: &mut Vec<usize>) {}
 
 fn count_for_repo_unfiltered(dash: &Dashboard, repo: &str) -> usize {
     dash.sessions
