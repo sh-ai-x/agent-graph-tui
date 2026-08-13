@@ -541,7 +541,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
     let mut last_branch: Option<String> = None;
     let current_group_top: usize = 0;
 
-    for &idx in &sorted {
+    for (position, &idx) in sorted.iter().enumerate() {
         let s = &dash.sessions[idx];
 
         // Branch sub-group — always shown.
@@ -558,7 +558,7 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
         let accent = agent_color(s.agent);
         block_starts.push(lines.len());
         group_tops.push(current_group_top);
-        push_session(&mut lines, dash, s, idx, inner_w, accent);
+        push_session(&mut lines, dash, s, idx, position, inner_w, accent);
 
         if last_agent != Some(s.agent) {
             last_agent = Some(s.agent);
@@ -590,11 +590,15 @@ fn push_session(
     lines: &mut Vec<Line<'static>>,
     dash: &Dashboard,
     s: &DiscoveredSession,
-    idx: usize,
+    _idx: usize,
+    position: usize,
     inner_w: usize,
     accent: Color,
 ) {
-    let marker = if idx == dash.selected { "▶ " } else { "  " };
+    // `position` is the index within the current nav scope (after the
+    // recency + nav_path filters), not the global session index. That
+    // matches `dash.selected` (= nav_index).
+    let marker = if position == dash.selected { "▶ " } else { "  " };
     let status = dash.tails.get(&s.path).map(|t| t.status).unwrap_or(crate::tree::SessionStatus::Done);
     let status_color = status.color();
 
@@ -644,7 +648,7 @@ fn push_session(
         ]));
     }
 
-    if idx == dash.selected {
+    if position == dash.selected {
         lines.push(Line::from(Span::styled(
             "        ── execution graph ──",
             Style::default().fg(accent),
