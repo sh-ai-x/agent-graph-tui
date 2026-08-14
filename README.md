@@ -1,34 +1,35 @@
 # agent-graph-tui
 
-Lightweight, single-binary terminal dashboard for AI-coding-agent
-**execution graphs**. Surfaces every active Claude Code / Codex / MiniMax /
-Gemini session on your machine, grouped by **agent → repo → branch**, with
-the model, worktree, task, live tail, and per-session status (running /
-done / failed / blocked) all in one TUI.
+Lightweight, single-binary terminal viewer for AI-coding-agent
+**execution graphs**. The multi-session dashboard surfaces every active
+Claude Code / Codex / MiniMax / Gemini session on your machine, grouped
+by **repo → branch**, with the per-session status (running / done /
+failed / blocked) on one TUI. For the full execution graph of a single
+session, run `agent-graph-tui <path>` (the single-session viewer).
 
 Read-only. No daemon. No server. No electron. ~0.7 MB binary, cold start
 ~1 s, ~10 MB RSS.
 
 ```
-$ agent-graph-tui           # multi-session dashboard (default)
 $ agent-graph-tui </dev/null
-agent-graph-tui — 2 of 32 sessions visible (text mode, cold start 1844.47 ms)
+agent-graph-tui — 29 of 32 sessions visible (text mode, cold start 2633.82 ms)
 
   agent-graph-tui
     ⏵ main
-      [○] MiniMax-M3              23 nodes
+      [○] 542646d4
 
   dev-harness-kit
     ⏵ main
-      [○] MiniMax-M3              22 nodes
+      [○] a5173104
+      [●] 9a627bcc
 ```
 
-The TUI itself (`agent-graph-tui` on a TTY) replaces the
-`[○] MiniMax-M3 ...` rows with the cyan-filled `●` glyph when the
-session is currently running, with the execution graph rendered
-inline beneath. The `f` key toggles between "active only" and
-"show all"; the auto-discovery on startup drills directly into the
-first running session.
+The TUI itself (`agent-graph-tui` on a TTY) replaces the `○` glyph with
+the cyan-filled `●` when the session is currently running. The `f` key
+toggles between "active only" and "show all"; the auto-discovery on
+startup drills directly into the first running session. Per-session
+content is intentionally minimal — drill into single-session mode
+(`agent-graph-tui <path>`) for the full execution graph.
 
 ```
 $ agent-graph-tui fixtures/sample.jsonl
@@ -149,12 +150,14 @@ The binary dispatches based on argv and TTY state.
 
 | Command | Mode |
 |---|---|
-| `agent-graph-tui` (no args, stdout is a TTY) | **Multi-session dashboard** — auto-discover and live-tail every active session |
+| `agent-graph-tui` (no args, stdout is a TTY) | **Multi-session dashboard** — auto-discover every active session; polls status every 100 ms |
 | `agent-graph-tui <path.jsonl>` (argv[1] is a file) | **Single-session viewer** — focused view of one session file |
 | `agent-graph-tui < …` (stdout is NOT a TTY) | **Plain-text fallback** — render a snapshot and exit; no raw mode, no interactive loop |
 
-The dispatch is in `src/main.rs`; the three modes share the same parser
-+ tree + render code, just different drivers.
+The dispatch is in `src/main.rs`. The single-session viewer uses
+`parser` + `tree` + `render`; the multi-session dashboard uses
+`discovery` + `tree` (for status) and shares no driver code with the
+single-session path.
 
 ### Multi-session dashboard (default, no args)
 
@@ -163,52 +166,66 @@ This is the primary use case. The binary:
 1. Scans up to **32** most-recent session files under
    `~/.claude/projects/`, `~/.codex/sessions/`, `~/.minimax/`, and
    `~/.gemini/`.
-2. For each, reads the first **64 KiB** (cheap) to extract:
+2. For each, reads the first **8 KiB** (cheap) to extract:
    - **agent kind** (path prefix)
-   - **model** (`message.model` on the first assistant message)
+   - **sid** (first 8 chars of the JSONL filename's UUID; strips Codex `rollout-<timestamp>-` prefix)
    - **cwd** (top-level `cwd` field of any JSONL line)
-   - **task** (first user message)
+   - **quick status** (last 64 KiB tail — see step 5)
 3. Runs `git -C <cwd> rev-parse --abbrev-ref HEAD` and
    `git -C <cwd> rev-parse --path-format=absolute --git-common-dir`
    to get the **branch** and the **main repo name** (the latter via
    `dirname` of the shared `.git/`, so worktrees resolve to the project
    root, not the worktree branch dir).
-4. Renders the sessions in a hierarchy: **agent → repo → branch**, with
-   the most-recent session first within each group. The selected
-   session's full execution graph (user / assistant / tool / result)
-   is shown inline below it.
-5. Re-discovers every 5 s. Live-tails each selected session at
-   100 ms / 30 fps.
+4. Renders the sessions in a hierarchy: **repo → branch → sessions**,
+   with the most-recent session first within each group. Each session
+   is one line: `[●/○] <sid>` — running status + short id only.
+5. Re-discovers every 5 s. Status is updated by polling each JSONL's
+   mtime; on change, re-runs `quick_status` (last 64 KiB tail) — cheap
+   enough to run every 100 ms across 32 sessions.
 
 #### Layout
 
-The TUI has three vertical regions:
+Actual TUI rendering (120×30, repo: `agent-graph-tui`, branch: `main`,
+1 session):
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ agent-graph-tui  N active sessions  ·  ↑/↓ … q quit         │ ← header (3 lines)
-├─────────────────────────────────────────────────────────────┤
-│  🤖 <agent>  (N sessions)            ← agent group header   │
-│    <repo>                            ← repo group header     │
-│      ⏵ <branch>  (N)                 ← branch group header   │
-│        [status] <model>  N nodes  relative_time             │
-│          task: <first user message>                          │
-│      ⏵ <branch>  (N)                                        │
-│        ▶ [status] <model>  N nodes  relative_time            │
-│          ── execution graph ──                              │
-│          user      "..."                                   │
-│          assistant "..."                                   │
-│          tool X   ...                ✓                      │
-│            └ result  ...           ✓                      │
-│          ...                                                  │
-├─────────────────────────────────────────────────────────────┤
-│ N/M · <agent>            live tailing · refresh 5 s        │ ← footer (1 line)
-└─────────────────────────────────────────────────────────────┘
+<!-- snapshot: docs/screenshots/tui-simplified.txt -->
+```text
+agent-graph-tui agent-graph-tui / main / sessions · 1 active sessions  ·  ↑/↓ move   ⏎ drill-down   ⌫ drill-up   f filte
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▶ ⏵ main                                                                                                                
+      ▶ [●] 542646d4                                                                                                    
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ 1/1 · claude-code   ⏎ drill-down · ⌫ drill-up · f filter (all) · r refresh · q quit
 ```
 
-Scroll is **group-anchored**: when you move the selection, the agent +
-repo + branch headers are kept at the top of the viewport so you never
-lose context. The session itself sits below them.
+Each session is one line: `[●/○] <sid>`. Move with `j`/`k`/`g`/`G`.
+Drill into a session by pressing Enter on it (currently this toggles
+an internal `expanded` flag; the inline execution-graph expansion is
+not implemented in this build — open the JSONL with
+`agent-graph-tui <path>` to see the graph).
 
 #### Status glyphs (per session)
 
@@ -219,13 +236,10 @@ lose context. The session itself sits below them.
 | `x` (red) | **Failed** — the last `tool_result` came back with `is_error: true` |
 | `?` (yellow) | **Blocked** — pending work AND no file activity for ≥ 5 minutes (likely waiting on user input) |
 
-The status is computed two ways:
-
-- **TUI mode**: from the parsed `tree::Session` (Pending / Done / Failed
-  on each row, aggregated to session-level).
-- **Text-mode / first paint**: from a cheap last-event probe
-  (`discovery::quick_status`) that reads only the last 8 KiB of the
-  JSONL and inspects the last non-empty line. No full parse.
+The status is computed by `discovery::quick_status` for both modes —
+a last-64-KiB tail read that inspects the most recent non-empty JSONL
+line. No full parse. This keeps the running dot cheap (32 files × <1 ms
+each per tick).
 
 #### Keybindings (dashboard mode)
 
@@ -235,7 +249,7 @@ The status is computed two ways:
 | `k` / `↑` | Previous session |
 | `g` | Jump to first session |
 | `G` | Jump to last session |
-| `r` | Force rediscovery (skip the 5 s timer) |
+| `r` | Force a fresh discovery scan (skip the 5 s timer) |
 | `q` / `Esc` | Quit |
 
 Mouse events are currently consumed by `EnableMouseCapture` but
@@ -274,16 +288,18 @@ interactive TUI loop entirely and prints a snapshot to stdout:
 ```sh
 $ agent-graph-tui | head -40
 
-agent-graph-tui — 32 sessions (text mode, cold start 1003.42 ms)
+agent-graph-tui — 32 of 32 sessions visible (text mode, cold start 1003.42 ms)
 
-🤖 claude-code (32 sessions)
   agent-graph-tui
     ⏵ main
-      [o] MiniMax-M3              23 nodes
-      [o] <unknown>                0 nodes
+      [○] 542646d4
+      [○] a5173104
   archidraw
     ⏵ main
-      [o] MiniMax-M3              33 nodes
+      [○] 03a418b5
+  dev-harness-kit
+    ⏵ fix/foo
+      [●] 9a627bcc
   ...
 ```
 
@@ -306,10 +322,10 @@ Auto-detected from the JSONL path:
 | `~/.gemini/**/*.jsonl` | `gemini` | ◆ |
 | anything else | `unknown` | ? |
 
-Within a `claude-code` session, the **model** field on the first
-assistant message is read and shown. So a single Claude Code session
-can be running `claude-opus-4-8` or `MiniMax-M3` or any other model the
-user configured.
+Neither the multi-session dashboard nor the single-session viewer
+displays the model field anymore (the discovery layer no longer
+extracts it). The model is whatever the agent was configured with —
+see the agent's own logs for that.
 
 ### Repo + branch
 
@@ -327,7 +343,7 @@ The cwd is read from the JSONL's top-level `cwd` field. If absent
 `std::env::current_dir()` — i.e., the directory you invoked
 `agent-graph-tui` from.
 
-### Execution graph
+### Execution graph (single-session viewer only)
 
 The per-session execution graph is the sequence:
 
@@ -348,9 +364,10 @@ shown in the dashboard is the worst of these: any `Failed` wins, else
 any `Pending` → `Running`, else `Done`. `Blocked` flips in when pending
 work goes ≥ 5 minutes without file activity.
 
-The dashboard's *selected* session expands its full execution graph
-inline, last 8 rows visible. Older rows scroll off the top of the
-inline panel.
+The execution graph is rendered only by the **single-session viewer**
+(`agent-graph-tui <path>`). Drill into single-session mode
+(`agent-graph-tui <path>`) to see the execution graph; the
+multi-session dashboard shows running status only.
 
 ---
 
@@ -360,13 +377,13 @@ inline panel.
 |---|---|---|
 | Binary size | ≤ 5 MB | 0.69 MB |
 | Cold start, single session (empty) | ≤ 50 ms | 0.45 ms |
-| Cold start, 32 sessions, dashboard mode | ≤ 2 s | 1.0 s |
+| Cold start, 32 sessions, dashboard mode | ≤ 2 s | 1.0–2.6 s |
 | Cold start, 3,418 .jsonl files in tree | — | 1.2 s |
 | Resident memory (idle) | ≤ 20 MB | ~10 MB |
 | Render at 1 k rows | ≤ 16 ms | ~3 ms |
 | Discovery refresh interval | — | 5 s |
-| Live-tail interval (selected session) | — | 100 ms / 30 fps |
-| Event ring cap | — | 50 000 events / session |
+| Status poll interval | — | 100 ms (mtime check; only re-runs quick_status on mtime change) |
+| JSONL head scan size (multi-session) | — | 8 KiB |
 | Per-file read cap | — | 256 MiB |
 
 The 3,418-file case is a real test on the user's machine (~32 active +
@@ -392,7 +409,7 @@ src/
 ├── lib.rs        Re-exports for the test suite
 ├── parser.rs     JSONL → Vec<Event> (multi-block, CRLF, ring cap, rotation)
 ├── tree.rs       Event → renderable rows + session_status aggregation
-├── discovery.rs  Active-session scan, agent kind, cwd, model, git_repo_root
+├── discovery.rs  Active-session scan, agent kind, cwd, sid, quick_status, git_repo_root
 ├── dashboard.rs  Multi-session TUI: state, app loop, hierarchical build_lines
 ├── render.rs     Single-session TUI
 └── app.rs        Single-session app loop
@@ -403,9 +420,10 @@ Module rules:
 - `parser` is **pure** (no I/O after `open`).
 - `tree` is **pure** (no I/O).
 - `discovery` does **all** the I/O — filesystem walk, file open,
-  `git` fork-exec.
-- `dashboard` owns the live state and the per-tick loop; it borrows
-  the parser/tree for tail updates.
+  `git` fork-exec, `quick_status` tail reads.
+- `dashboard` owns the live state and the per-tick loop; uses
+  `discovery::quick_status` for status polling (no per-tick
+  parser/tree).
 - `render` is **pure** styling — given a `tree::Session`, paint it.
 - `app` is the single-session equivalent of `dashboard::run`.
 
@@ -428,7 +446,7 @@ cargo build                    # debug binary
 
 # run tests
 cargo test --release --lib
-# 45 unit tests; takes <1 s on a warm cache.
+# 51 unit tests; takes <1 s on a warm cache.
 
 # format / lint
 cargo fmt
@@ -438,16 +456,16 @@ cargo clippy -- -D warnings
 cargo watch -x 'build --release'      # install `cargo-watch` once
 ```
 
-### Test inventory (45 tests, all `cargo test`)
+### Test inventory (51 tests, all `cargo test`)
 
 | Module | Group | Count |
 |---|---|---|
-| `parser` | multi-block assistant, CRLF, file rotation, ring cap, malformed JSON, marker edges | 10 |
-| `tree` | pending / done / failed, orphan results, extend + clear, session_status aggregation (8 sub-cases) | 13 |
-| `discovery` | agent kind classification, first user message extraction (string + content-array + escaped quotes), worktree decode, `quick_status` (7 sub-cases) | 13 |
-| `dashboard` | `build_lines` headers (agent / repo / branch change), ordering, `compute_scroll` group-anchored | 7 |
-| `repo_root` | worktree → main repo via `--git-common-dir` | 1 |
-| `extract_*` | `cwd` / `model` / `worktree_name` | (subset of discovery) |
+| `parser` | multi-block assistant, CRLF, file rotation, ring cap, malformed JSON, marker edges | 7 |
+| `tree` | pending / done / failed, orphan results, extend + clear, session_status aggregation (8 sub-cases) | 14 |
+| `discovery` | agent kind classification, sid extraction (bare UUID + Codex rollout prefix + truncation), worktree decode, `quick_status` (7 sub-cases) | 16 |
+| `dashboard` | `build_lines` headers (repo / branch change), ordering, `compute_scroll` group-anchored | 14 |
+| `repo_root` | worktree → main repo via `--git-common-dir` | (subset of discovery) |
+| `extract_*` | `cwd` / `sid` / `worktree_name` | (subset of discovery) |
 
 ### Pre-push hook
 
@@ -467,8 +485,9 @@ flag, open an issue.
 
 Things you might think need configuration but don't:
 
-- **JSONL head scan size** — fixed at 64 KiB. Larger files are
-  partially parsed; the model field is whatever's in the first 64 KiB.
+- **JSONL head scan size (multi-session)** — 8 KiB. The first 8 KiB is
+  enough to find the cwd field; we don't need model or task text in
+  the dashboard view.
 - **Number of sessions** — capped at 32. Older ones are dropped
   silently.
 - **Agent classification** — purely path-based. Override by symlinking
@@ -514,17 +533,13 @@ many sessions in the same worktree, the worktree itself may be slow
 
 That bypasses discovery entirely.
 
-**All sessions show `<unknown>` model**
+**Two sessions on the same repo+branch show the same sid**
 
-The first assistant message in the JSONL is past the first 64 KiB.
-Either the model is being inferred from a later line (we don't
-currently re-scan), or the session has only user messages so far (the
-agent hasn't replied yet — model field is per-assistant-message).
-
-**All sessions show `0 nodes`**
-
-Same reason — the file is mostly user messages and we haven't seen any
-tool_use / tool_result pairs yet. New sessions look like this.
+sids are derived from the JSONL filename's first 8 hex chars (with
+the Codex `rollout-<timestamp>-` prefix stripped). The 8-char prefix
+is rarely unique; collisions in the first 8 chars are possible. The
+full UUID is in the filename — look at the file path under
+`~/.claude/projects/.../<uuid>.jsonl` to disambiguate.
 
 **Branch shows `?`**
 
@@ -548,12 +563,17 @@ support `--path-format=absolute --git-common-dir`. Upgrade `git` to
   handlers. Keyboard only.
 - **No drag-and-drop** — not a thing in this tool. (The earlier
   conversation about it was a miscommunication.)
-- **No graph layout engine** — the execution tree is a unicode tree
-  (├─ / └─), not a real DAG layout. If your session has parallel
-  tool calls, the display is still linearised.
-- **Model is per first-assistant-message** — if the agent switches
-  models mid-session (e.g. Claude Code calls `minimax/M3` for a tool),
-  we don't re-detect. Only the first model is shown.
+- **No graph layout engine** — the single-session execution tree is a
+  unicode tree (├─ / └─), not a real DAG layout. If your session has
+  parallel tool calls, the display is still linearised. The
+  multi-session dashboard intentionally has no graph at all — it
+  shows one line per session.
+- **No per-session model display** — the multi-session dashboard shows
+  running status only. To see which model a session is using, drill
+  into single-session mode (`agent-graph-tui <path>`).
+- **No drill-into-graph from the dashboard** — opening
+  `agent-graph-tui <path>` for the selected sid is not yet wired (open
+  an issue).
 - **No Windows** — the file open + readdir code paths are POSIX-only
   in practice. PRs welcome.
 - **No multi-CLI processes** — each binary is one TUI. Run multiple
