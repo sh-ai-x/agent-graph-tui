@@ -161,16 +161,12 @@ fn run_dashboard(started: Instant) -> ExitCode {
                 .get(&s.path)
                 .map(|t| t.status)
                 .unwrap_or(s.quick_status);
-            let model = s.model.clone().unwrap_or_else(|| "<unknown>".into());
             let _ = writeln!(
                 lock,
-                "      [{}] {model:<22} {:>3} nodes",
+                "      [{}] {}",
                 status.glyph(),
-                s.node_count_proxy
+                s.sid
             );
-            if let Some(t) = &s.task {
-                let _ = writeln!(lock, "        task: {t}");
-            }
         }
         return ExitCode::SUCCESS;
     }
