@@ -185,27 +185,47 @@ This is the primary use case. The binary:
 
 #### Layout
 
-The TUI has three vertical regions:
+Actual TUI rendering (120×30, repo: `agent-graph-tui`, branch: `main`,
+1 session):
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ agent-graph-tui  N active sessions  ·  ↑/↓ … q quit         │ ← header (3 lines)
-├─────────────────────────────────────────────────────────────┤
-│  <repo>                            ← repo group header     │
-│    ⏵ <branch>  (N)                 ← branch group header   │
-│      [status] <sid>                                         │
-│      ▶ [status] <sid>                                       │
-│    ⏵ <branch>  (N)                                         │
-│      [status] <sid>                                         │
-├─────────────────────────────────────────────────────────────┤
-│ N/M            refreshing every 5 s · status poll 100 ms   │ ← footer (1 line)
-└─────────────────────────────────────────────────────────────┘
+<!-- snapshot: docs/screenshots/tui-simplified.txt -->
+```text
+agent-graph-tui agent-graph-tui / main / sessions · 1 active sessions  ·  ↑/↓ move   ⏎ drill-down   ⌫ drill-up   f filte
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▶ ⏵ main                                                                                                                
+      ▶ [●] 542646d4                                                                                                    
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+ 1/1 · claude-code   ⏎ drill-down · ⌫ drill-up · f filter (all) · r refresh · q quit
 ```
 
-One line per session. The per-session content is intentionally
-minimal: a status glyph (`●` running / `○` done / `✗` failed / `?`
-blocked) plus the short sid. To see the full execution graph for a
-session, run `agent-graph-tui <path>` against its JSONL.
+Each session is one line: `[●/○] <sid>`. Move with `j`/`k`/`g`/`G`.
+Drill into a session by pressing Enter on it (currently this toggles
+an internal `expanded` flag; the inline execution-graph expansion is
+not implemented in this build — open the JSONL with
+`agent-graph-tui <path>` to see the graph).
 
 #### Status glyphs (per session)
 
