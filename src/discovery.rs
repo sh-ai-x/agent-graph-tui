@@ -73,6 +73,9 @@ impl AgentKind {
 #[derive(Debug, Clone)]
 pub struct DiscoveredSession {
     pub path: PathBuf,
+    /// Short session id derived from the filename — first 8 hex chars of
+    /// the UUID. Used as the dashboard's per-session label.
+    pub sid: String,
     pub agent: AgentKind,
     /// Display name of the model used in the first assistant message
     /// (e.g. `claude-opus-4-8`, `MiniMax-M3`). The agent kind is the
@@ -282,82 +285,59 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
 
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
-    // Read up to 64 KiB so we likely cover the first assistant message (model
-    // field) AND the first user message (cwd field). 8 KiB was too small.
-    let mut head = vec![0u8; 64 * 1024];
+    // Read up to 8 KiB of head — just enough to pick up the cwd field for
+    // git enrichment. We no longer extract model / task / node_count on
+    // disk; the simplified dashboard only needs sid + status.
+    let mut head = vec![0u8; 8 * 1024];
     let n = f.read(&mut head).unwrap_or(0);
     head.truncate(n);
     let head_str = std::str::from_utf8(&head).unwrap_or("");
 
     let agent = AgentKind::from_path(path);
-    let model = extract_model(path);
     let cwd = extract_cwd(head_str);
     let worktree_name = extract_worktree_name(path);
-    let task = first_user_message(head_str);
-
-    let node_count_proxy = head_str.bytes().filter(|&b| b == b'\n').count();
 
     Some(DiscoveredSession {
         path: path.to_path_buf(),
+        sid: extract_sid(path),
         agent,
-        model,
+        model: None,
         cwd,
         worktree_name,
         branch: None,
         repo_name: None,
         quick_status: quick_status(path),
-        task,
+        task: None,
         size_bytes: size,
         modified,
-        node_count_proxy,
+        node_count_proxy: 0,
     })
 }
 
-fn first_user_message(head: &str) -> Option<String> {
-    for line in head.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        // User message — could be plain string content or content array with
-        // text/tool_result blocks. Extract the first text block, falling back
-        // to a plain string content.
-        let is_user = v.get("type").and_then(|t| t.as_str()) == Some("user")
-            || v.get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(|r| r.as_str())
-                == Some("user");
-        if !is_user {
-            break;
-        }
-        let content = v.get("message").and_then(|m| m.get("content"))?;
-        if let Some(s) = content.as_str() {
-            return Some(unescape(s));
-        }
-        if let Some(arr) = content.as_array() {
-            for b in arr {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                        return Some(unescape(t));
-                    }
-                }
+/// Derive a short, stable session id from the JSONL filename. For Codex's
+/// `rollout-<timestamp>-<uuid>.jsonl` we strip the timestamp prefix and
+/// return the first 8 hex chars of the uuid. For bare `<uuid>.jsonl`
+/// (Claude Code / others) we just take the first 8 chars of the stem.
+pub fn extract_sid(path: &Path) -> String {
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return String::new(),
+    };
+    if let Some(rest) = stem.strip_prefix("rollout-") {
+        // The timestamp portion is digits, dashes, and 'T'. The uuid
+        // portion that follows contains hex letters. Walk forward until
+        // we hit the first hex letter; step back one byte to include the
+        // digit (or dash) that precedes it — that's the start of the uuid.
+        for (i, c) in rest.char_indices() {
+            if c.is_ascii_hexdigit() && !c.is_ascii_digit() {
+                let start = if i > 0 { i - 1 } else { 0 };
+                return rest[start..].chars().take(8).collect();
             }
         }
-        break;
+        // Fallback if the uuid portion isn't found.
+        return rest.chars().take(8).collect();
     }
-    None
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("\\n", " ")
-        .replace("\\\"", "\"")
-        .replace("\\t", " ")
-        .trim()
-        .to_string()
+    stem.chars().take(8).collect()
 }
 
 /// Pulls the cwd from the first JSONL line that has a top-level `cwd`
@@ -452,58 +432,6 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
     tree::SessionStatus::Done
 }
 
-/// Probe a parsed JSONL line for the model name. Different agent CLIs
-/// put the model field in different places:
-///
-/// - Claude Code / MiniMax inside Claude Code:  `message.model`
-/// - Codex (openai's CLI):                       `payload.model`
-/// - Future / one-off formats:                   top-level `model`
-///
-/// Returns the first non-empty match across these paths, in order.
-fn model_from_value(v: &serde_json::Value) -> Option<String> {
-    let candidates = [
-        v.get("message").and_then(|m| m.get("model")),
-        v.get("payload").and_then(|p| p.get("model")),
-        v.get("response").and_then(|r| r.get("model")),
-        v.get("model"),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find_map(|m| m.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Walk up to `MODEL_SCAN_BYTES` of the file, line by line, looking for
-/// the first JSONL line that has a model field. Most sessions put the
-/// model in the first 8-20 KiB; 64 KiB is a safe upper bound.
-const MODEL_SCAN_BYTES: u64 = 64 * 1024;
-
-fn extract_model(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let read_up_to = len.min(MODEL_SCAN_BYTES);
-    let mut buf = vec![0u8; read_up_to as usize];
-    let _ = f.read(&mut buf).ok()?;
-    let text = std::str::from_utf8(&buf).unwrap_or("");
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(m) = model_from_value(&v) {
-            return Some(m);
-        }
-    }
-    None
-}
-
 /// Pulls the worktree name out of the project dir's `--worktrees-X` suffix,
 /// when the session was started inside a git worktree. Returns `None` for
 /// sessions started in the main repo.
@@ -584,27 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn first_user_message_extracts_initial_prompt() {
-        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"fix the parser bug\"},\"timestamp\":\"t0\"}\n";
-        let msg = first_user_message(head).unwrap();
-        assert_eq!(msg, "fix the parser bug");
-    }
-
-    #[test]
-    fn first_user_message_handles_escaped_quotes() {
-        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"run \\\"foo\\\" and check\"},\"timestamp\":\"t0\"}\n";
-        let msg = first_user_message(head).unwrap();
-        assert_eq!(msg, "run \"foo\" and check");
-    }
-
-    #[test]
-    fn first_user_message_handles_content_array_text_block() {
-        let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n";
-        let msg = first_user_message(head).unwrap();
-        assert_eq!(msg, "hi");
-    }
-
-    #[test]
     fn extract_worktree_name_parses_dash_double_worktrees() {
         let p = Path::new(
             "/home/u/.claude/projects/-Users-sanghee-dev-agent-graph-tui--worktrees-multi-session-dashboard/abc.jsonl",
@@ -621,72 +528,24 @@ mod tests {
     }
 
     #[test]
-    fn extract_model_picks_up_message_model_field() {
-        let path = write_temp_jsonl(
-            "claude_code",
-            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
-             {\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n",
-        );
-        let model = extract_model(&path).unwrap();
-        assert_eq!(model, "claude-opus-4-8");
-        let _ = std::fs::remove_file(&path);
+    fn extract_sid_takes_first_eight_of_bare_uuid() {
+        let p = Path::new("/h/3447e668-a07b-4f7c-b0e8-dafefaa48374.jsonl");
+        assert_eq!(extract_sid(p), "3447e668");
     }
 
     #[test]
-    fn extract_model_picks_up_payload_model_field_for_codex() {
-        let path = write_temp_jsonl(
-            "codex",
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"abc\"}}\n\
-             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"model\":\"gpt-4o\"}}\n",
+    fn extract_sid_parses_codex_rollout_uuid() {
+        let p = Path::new(
+            "/h/rollout-2025-09-17T19-05-35-9a6a7c2d-519d-4c07-b9ec-87b9ffd102f0.jsonl",
         );
-        let model = extract_model(&path).unwrap();
-        assert_eq!(model, "gpt-4o");
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(extract_sid(p), "9a6a7c2d");
     }
 
     #[test]
-    fn extract_model_picks_up_top_level_model_field() {
-        let path = write_temp_jsonl(
-            "top_level",
-            "{\"type\":\"response\",\"model\":\"o1-preview\",\"content\":\"...\"}\n",
-        );
-        let model = extract_model(&path).unwrap();
-        assert_eq!(model, "o1-preview");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn extract_model_returns_none_when_no_model_field_anywhere() {
-        let path = write_temp_jsonl(
-            "no_model",
-            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
-             {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
-        );
-        let model = extract_model(&path);
-        assert!(model.is_none());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn extract_model_picks_up_model_in_later_lines_not_just_head() {
-        // The first 200 bytes are a user message + first assistant reply
-        // (no model field — it's a placeholder). The model field appears
-        // ~50 KB later. With the 64 KiB head scan we'd miss it.
-        let mut buf = String::new();
-        buf.push_str("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n");
-        buf.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"thinking\"}]}}\n");
-        // Pad with placeholder assistant replies (no model) to push the
-        // real one past 64 KiB.
-        for _ in 0..300 {
-            buf.push_str(
-                "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}\n",
-            );
-        }
-        buf.push_str("{\"type\":\"assistant\",\"message\":{\"id\":\"m_real\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-7\",\"content\":[{\"type\":\"text\",\"text\":\"real answer\"}]}}\n");
-        let path = write_temp_jsonl("late_model", &buf);
-        let model = extract_model(&path).unwrap();
-        assert_eq!(model, "claude-sonnet-4-7");
-        let _ = std::fs::remove_file(&path);
+    fn extract_sid_truncates_long_stem() {
+        // Plain long stem with no prefix → first 8 chars.
+        let p = Path::new("/h/abcdefghijklmnop.jsonl");
+        assert_eq!(extract_sid(p), "abcdefgh");
     }
 
     // quick_status — exercises the last-event probe used by the text-mode

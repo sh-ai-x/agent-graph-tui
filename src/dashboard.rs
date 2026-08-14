@@ -1,7 +1,7 @@
-//! Multi-session dashboard state: discovery + per-session tail + tree cache.
+//! Multi-session dashboard state: discovery + per-session cheap status polling.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -13,36 +13,28 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui::Terminal;
 
-use crate::discovery::{AgentKind, DiscoveredSession, DiscoveryReport};
-use crate::tree::{session_status, Node, NodeKind, SessionStatus, Status};
-use crate::{parser, tree};
+use crate::discovery::{quick_status, AgentKind, DiscoveredSession, DiscoveryReport};
+use crate::tree::SessionStatus;
 
 const MAX_SESSIONS: usize = 32;
-const RESCAN_BUDGET: Duration = Duration::from_millis(100);
+const TAIL_POLL_BUDGET: Duration = Duration::from_millis(250);
 const REDISCOVERY_BUDGET: Duration = Duration::from_secs(5);
 
+/// Per-session polling state. Cheap: just the current status + the last
+/// file mtime we observed. We poll mtime on every tick; if unchanged, we
+/// skip the JSONL read entirely.
 pub struct TailState {
-    pub parser: Option<parser::Session>,
-    pub tree: tree::Session,
-    pub consumed: usize,
-    pub offset: u64,
-    pub last_rescan: Instant,
-    pub last_error: Option<String>,
-    pub loaded: bool,
     pub status: SessionStatus,
+    pub last_mtime: Option<std::time::SystemTime>,
+    pub last_poll: Instant,
 }
 
 impl TailState {
-    fn unloaded() -> Self {
+    fn empty() -> Self {
         Self {
-            parser: None,
-            tree: tree::Session::new(),
-            consumed: 0,
-            offset: 0,
-            last_rescan: Instant::now(),
-            last_error: None,
-            loaded: false,
             status: SessionStatus::Done,
+            last_mtime: None,
+            last_poll: Instant::now(),
         }
     }
 }
@@ -83,28 +75,6 @@ enum NavItem {
 }
 
 impl Dashboard {
-    /// Build a `TailState` from a freshly-loaded parser session. Computes the
-    /// initial session-level status from the rows.
-    fn fresh_tail_at(p: parser::Session) -> TailState {
-        let consumed = p.events.len();
-        let offset = std::fs::metadata(&p.path).map(|m| m.len()).unwrap_or(0);
-        let tree = tree::Session::build(&p);
-        let modified = std::fs::metadata(&p.path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let status = session_status(&tree.rows, modified);
-        TailState {
-            parser: Some(p),
-            tree,
-            consumed,
-            offset,
-            last_rescan: Instant::now(),
-            last_error: None,
-            loaded: true,
-            status,
-        }
-    }
-
     pub fn from_report(report: DiscoveryReport) -> Self {
         let sessions: Vec<_> = report.sessions.into_iter().take(MAX_SESSIONS).collect();
         let mut dash = Self {
@@ -116,20 +86,13 @@ impl Dashboard {
             recent_only: true,
             expanded: None,
         };
-        // Lazy: insert metadata-only entries; defer full parse to load_tail().
+        // Lazy: insert empty entries; populate `status` via tick_tails on the
+        // first poll that observes a non-zero mtime.
         for s in &sessions {
-            dash.tails
-                .entry(s.path.clone())
-                .or_insert_with(TailState::unloaded);
+            dash.tails.entry(s.path.clone()).or_insert_with(TailState::empty);
         }
         dash.sessions = sessions;
         dash
-    }
-
-    fn ensure_tail(&mut self, s: &DiscoveredSession) {
-        self.tails
-            .entry(s.path.clone())
-            .or_insert_with(TailState::unloaded);
     }
 
     /// Whether a session should be visible given the current `recent_only`
@@ -229,38 +192,6 @@ impl Dashboard {
         }
         false
     }
-    /// Open the parser and build the initial tree for a session; idempotent.
-    pub fn load_tail(&mut self, path: &Path) -> bool {
-        let needs_load = self.tails.get(path).map(|t| !t.loaded).unwrap_or(true);
-        if !needs_load {
-            return false;
-        }
-        match parser::Session::open(path) {
-            Ok(p) => {
-                let new_tail = Self::fresh_tail_at(p);
-                if let Some(tail) = self.tails.get_mut(path) {
-                    *tail = new_tail;
-                }
-                true
-            }
-            Err(e) => {
-                if let Some(tail) = self.tails.get_mut(path) {
-                    tail.last_error = Some(e.to_string());
-                    tail.loaded = false;
-                }
-                false
-            }
-        }
-    }
-
-    /// Toggle a non-selected tail loaded — used by the renderer before drawing
-    /// its execution graph so the user sees fresh data immediately.
-    pub fn ensure_loaded(&mut self, idx: usize) {
-        if let Some(s) = self.sessions.get(idx).cloned() {
-            self.load_tail(&s.path);
-        }
-    }
-
     pub fn tick_discovery(&mut self) {
         if self.last_discovery.elapsed() < REDISCOVERY_BUDGET {
             return;
@@ -271,19 +202,8 @@ impl Dashboard {
         self.sessions = report.sessions.into_iter().take(MAX_SESSIONS).collect();
         self.tails
             .retain(|path, _| self.sessions.iter().any(|s| &s.path == path));
-        let snapshot = self.sessions.clone();
-        for s in &snapshot {
-            self.ensure_tail(s);
-        }
-        // Newly visible sessions that haven't been loaded yet need their
-        // tail parsed so the real status is determined. Without this, a
-        // brand-new session stays at `quick_status` = Done (no events
-        // yet), and the user wouldn't see it as Running until they
-        // navigate to it.
-        for s in &snapshot {
-            if self.session_visible(s) {
-                self.load_tail(&s.path);
-            }
+        for s in &self.sessions {
+            self.tails.entry(s.path.clone()).or_insert_with(TailState::empty);
         }
         if self.selected >= self.nav_items().len() {
             self.selected = self.nav_items().len().saturating_sub(1);
@@ -293,76 +213,27 @@ impl Dashboard {
         if self.nav_path.is_empty() {
             self.focus_first_running();
         }
-        // Avoid repeatedly visiting the existing first running one.
         let _ = before;
         self.last_discovery = Instant::now();
     }
 
+    /// Poll each session's JSONL mtime. If it changed since the last poll,
+    /// re-run the cheap `quick_status` probe (last-event walk, no full parse)
+    /// and update `tail.status`. Skips work entirely on quiet files.
     pub fn tick_tails(&mut self) {
-        // First, collect paths of unloaded tails whose file now has content,
-        // so we can load them after releasing the iter_mut borrow.
-        let to_load: Vec<PathBuf> = self
-            .tails
-            .iter()
-            .filter(|(path, tail)| {
-                !tail.loaded
-                    && std::fs::metadata(path)
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false)
-            })
-            .map(|(path, _)| path.clone())
-            .collect();
-        for path in to_load {
-            self.load_tail(&path);
-        }
-
+        let now = Instant::now();
         for (path, tail) in self.tails.iter_mut() {
-            if !tail.loaded {
+            // Throttle per-tail: avoid the metadata syscall on every UI tick.
+            if tail.last_mtime.is_some() && now.duration_since(tail.last_poll) < TAIL_POLL_BUDGET {
                 continue;
             }
-            if tail.last_rescan.elapsed() < RESCAN_BUDGET {
+            tail.last_poll = now;
+            let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            if mtime == tail.last_mtime {
                 continue;
             }
-            let parser = match tail.parser.as_mut() {
-                Some(p) => p,
-                None => continue,
-            };
-            match parser.rescan_from(tail.offset) {
-                Ok(outcome) => {
-                    tail.offset = outcome.new_offset;
-                    tail.last_error = None;
-                    let cur_len = parser.events.len();
-                    if outcome.rebuilt || cur_len < tail.consumed {
-                        tail.tree = tree::Session::build(parser);
-                    } else if cur_len > tail.consumed {
-                        let delta = &parser.events[tail.consumed..cur_len];
-                        tail.tree.extend_from(delta);
-                    }
-                    tail.consumed = cur_len;
-                }
-                Err(e) => {
-                    tail.last_error = Some(e.to_string());
-                }
-            }
-            tail.last_rescan = Instant::now();
-            // Recompute session-level status from the latest tree rows.
-            let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
-            tail.status = session_status(&tail.tree.rows, modified);
-        }
-    }
-
-    /// Pre-load the tail of every session that is currently Running, so
-    /// their execution graphs are visible on first paint of the Sessions
-    /// view. Cheap — the parser is lazy; we just kick off the load.
-    pub fn autoload_running(&mut self) {
-        let recent_running: Vec<PathBuf> = self
-            .sessions
-            .iter()
-            .filter(|s| self.is_running(s))
-            .map(|s| s.path.clone())
-            .collect();
-        for path in recent_running {
-            self.load_tail(&path);
+            tail.last_mtime = mtime;
+            tail.status = quick_status(path);
         }
     }
 
@@ -372,11 +243,6 @@ impl Dashboard {
     pub fn selected_session(&self) -> Option<&DiscoveredSession> {
         let idx = self.focused_session()?;
         self.sessions.get(idx)
-    }
-
-    pub fn selected_tail(&self) -> Option<&TailState> {
-        self.selected_session()
-            .and_then(|s| self.tails.get(&s.path))
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -393,9 +259,6 @@ impl Dashboard {
             i = n - 1;
         }
         self.selected = i as usize;
-        if let Some(s) = self.focused_session() {
-            self.ensure_loaded(s);
-        }
     }
 
     /// Items in the current nav level. Top level = repos; inside a repo
@@ -491,7 +354,6 @@ impl Dashboard {
                     self.expanded = None;
                 } else {
                     self.expanded = Some(path);
-                    self.ensure_loaded(s);
                 }
             }
         }
@@ -544,9 +406,8 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
     f.render_widget(header, chunks[0]);
 
     // Body lines.
-    let inner_w = area.width.saturating_sub(2) as usize;
     let viewport = chunks[1].height as usize;
-    let (lines, block_starts, group_tops) = build_lines(dash, inner_w);
+    let (lines, block_starts, group_tops) = build_lines(dash);
 
     let scroll = compute_scroll(
         block_starts.get(dash.selected).copied(),
@@ -591,7 +452,7 @@ pub fn draw(f: &mut Frame, dash: &Dashboard) {
     f.render_widget(footer, chunks[2]);
 }
 
-fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
+fn build_lines(dash: &Dashboard) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut block_starts: Vec<usize> = Vec::new();
     let mut group_tops: Vec<usize> = Vec::new();
@@ -737,10 +598,9 @@ fn build_lines(dash: &Dashboard, inner_w: usize) -> (Vec<Line<'static>>, Vec<usi
             last_branch = Some(branch_disp);
         }
 
-        let accent = agent_color(s.agent);
         block_starts.push(lines.len());
         group_tops.push(current_group_top);
-        push_session(&mut lines, dash, s, idx, position, inner_w, accent);
+        push_session(&mut lines, dash, s, position);
 
         if last_agent != Some(s.agent) {
             last_agent = Some(s.agent);
@@ -773,10 +633,7 @@ fn push_session(
     lines: &mut Vec<Line<'static>>,
     dash: &Dashboard,
     s: &DiscoveredSession,
-    _idx: usize,
     position: usize,
-    inner_w: usize,
-    accent: Color,
 ) {
     // `position` is the index within the current nav scope (after the
     // recency + nav_path filters), not the global session index. That
@@ -790,173 +647,23 @@ fn push_session(
         .tails
         .get(&s.path)
         .map(|t| t.status)
-        .unwrap_or(crate::tree::SessionStatus::Done);
+        .unwrap_or(SessionStatus::Done);
     let status_color = status.color();
 
-    let _branch = s.branch.clone().unwrap_or_else(|| "—".to_string());
-    let task = s.task.clone().unwrap_or_default();
-    let task_trim = truncate(&task, inner_w.saturating_sub(20));
-    let node_count = s.node_count_proxy;
-    let modified = s
-        .modified
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| format_relative(d.as_secs()))
-        .unwrap_or_else(|| "?".into());
-
-    lines.push(Line::from({
-        let mut spans = vec![
-            Span::raw("      "),
-            Span::styled(
-                format!("[{}] ", status.glyph()),
-                Style::default()
-                    .fg(status_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                marker.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if let Some(model) = &s.model {
-            spans.push(Span::styled(
-                format!("{:<14} ", model_short(model)),
-                Style::default().fg(Color::Magenta),
-            ));
-        } else {
-            spans.push(Span::styled(
-                format!("{:<14} ", "<unknown>"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        spans.push(Span::styled(
-            format!("{node_count:>3} nodes"),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(modified, Style::default().fg(Color::DarkGray)));
-        Line::from(spans)
-    }));
-
-    if !task_trim.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("        task: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(task_trim, Style::default().fg(Color::Gray)),
-        ]));
-    }
-
-    if position == dash.selected {
-        lines.push(Line::from(Span::styled(
-            "        ── execution graph ──",
-            Style::default().fg(accent),
-        )));
-        if let Some(tail) = dash.tails.get(&s.path) {
-            if let Some(err) = &tail.last_error {
-                lines.push(Line::from(vec![
-                    Span::styled("          ⚠ ", Style::default().fg(Color::Red)),
-                    Span::styled(err.clone(), Style::default().fg(Color::Red)),
-                ]));
-            }
-            let recent: Vec<&Node> = tail.tree.rows.iter().rev().take(8).collect();
-            for n in recent.iter().rev() {
-                lines.push(render_dashboard_row(n, accent));
-            }
-        } else {
-            lines.push(Line::from(Span::styled(
-                "        (no tail state yet)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-
-    lines.push(Line::from(""));
-}
-
-fn render_dashboard_row(n: &Node, accent: Color) -> Line<'static> {
-    let prefix = if n.depth == 0 {
-        "    "
-    } else {
-        "      └─ "
-    };
-    let (kind_label, kind_color) = match &n.kind {
-        NodeKind::UserText(_) => ("user".to_string(), Color::Cyan),
-        NodeKind::AssistantText(_) => ("assistant".to_string(), Color::Magenta),
-        NodeKind::ToolCall { name, .. } => (format!("tool {name}"), accent),
-        NodeKind::ToolResult(_) => ("result".to_string(), Color::Blue),
-        NodeKind::Unknown(_) => ("?".to_string(), Color::Red),
-    };
-    let body: String = match &n.kind {
-        NodeKind::UserText(t)
-        | NodeKind::AssistantText(t)
-        | NodeKind::ToolResult(t)
-        | NodeKind::Unknown(t) => truncate(t, 70),
-        NodeKind::ToolCall { input, .. } => truncate(input, 70),
-    };
-    let (status_glyph, status_color) = match n.status {
-        Status::Pending => ("  …", Color::Yellow),
-        Status::Done => ("  ✓", Color::Green),
-        Status::Failed => ("  ✗", Color::Red),
-    };
-    Line::from(vec![
-        Span::raw(prefix.to_string()),
+    lines.push(Line::from(vec![
+        Span::raw("      "),
         Span::styled(
-            format!("{kind_label:<18} "),
-            Style::default().fg(kind_color),
+            marker.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(body),
-        Span::styled(status_glyph, Style::default().fg(status_color)),
-    ])
-}
-
-fn agent_color(kind: AgentKind) -> Color {
-    match kind {
-        AgentKind::ClaudeCode => Color::Cyan,
-        AgentKind::Codex => Color::Magenta,
-        AgentKind::MiniMax => Color::Yellow,
-        AgentKind::Gemini => Color::Green,
-        AgentKind::Unknown => Color::DarkGray,
-    }
-}
-
-/// Shorten a model identifier to its family + version (drops vendor prefixes).
-fn model_short(model: &str) -> String {
-    // "claude-opus-4-8"        -> "claude-opus-4-8"
-    // "claude-3-5-sonnet-..."   -> "claude-3-5-sonnet"
-    // "MiniMax-M3[1m]"     -> "minimax-m3"
-    let m = model.to_lowercase();
-    if let Some(stripped) = m.strip_prefix("claude-") {
-        stripped.split('-').take(3).collect::<Vec<_>>().join("-")
-    } else if m.contains("minimax") {
-        "minimax".to_string()
-    } else {
-        // First 8 chars, lowercase
-        m.chars().take(8).collect()
-    }
-}
-
-fn format_relative(secs_since_epoch: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let delta = now.saturating_sub(secs_since_epoch);
-    if delta < 60 {
-        format!("{delta}s ago")
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86_400 {
-        format!("{}h ago", delta / 3600)
-    } else {
-        format!("{}d ago", delta / 86_400)
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
+        Span::styled(
+            format!("[{}] ", status.glyph()),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(s.sid.clone(), Style::default().fg(Color::White)),
+    ]));
 }
 
 fn compute_scroll(
@@ -991,6 +698,7 @@ mod tests {
     fn sess(agent: AgentKind, repo: &str, branch: &str) -> DiscoveredSession {
         DiscoveredSession {
             path: std::path::PathBuf::from(format!("/tmp/{}/{}", repo, branch)),
+            sid: String::new(),
             agent,
             model: None,
             cwd: None,
@@ -1015,9 +723,10 @@ mod tests {
             recent_only: false,
             expanded: None,
         };
-        let snapshot = sessions.clone();
-        for s in &snapshot {
-            d.ensure_tail(s);
+        for s in &sessions {
+            d.tails
+                .entry(s.path.clone())
+                .or_insert_with(TailState::empty);
         }
         d.sessions = sessions;
         d
@@ -1032,7 +741,7 @@ mod tests {
         let _ = dash;
         // We can't easily read render_lines without a Frame, but we can
         // assert build_lines doesn't panic and produces some output.
-        let _ = build_lines(&dash, 80);
+        let _ = build_lines(&dash);
     }
 
     #[test]
@@ -1041,7 +750,7 @@ mod tests {
             sess(AgentKind::ClaudeCode, "agent-graph-tui", "main"),
             sess(AgentKind::ClaudeCode, "boilerplate-web", "main"),
         ]);
-        let _ = build_lines(&dash, 80);
+        let _ = build_lines(&dash);
     }
 
     #[test]
@@ -1050,7 +759,7 @@ mod tests {
             sess(AgentKind::ClaudeCode, "agent-graph-tui", "main"),
             sess(AgentKind::ClaudeCode, "agent-graph-tui", "feat/x"),
         ]);
-        let _ = build_lines(&dash, 80);
+        let _ = build_lines(&dash);
     }
 
     #[test]
@@ -1063,7 +772,7 @@ mod tests {
         ]);
         // Expected order: claude-code / a / 1, claude-code / a / 2,
         // claude-code / b / 1, minimax / z / 1
-        let _ = build_lines(&dash, 80);
+        let _ = build_lines(&dash);
     }
 
     #[test]
@@ -1094,6 +803,7 @@ mod tests {
     fn sess_with_status(quick: crate::tree::SessionStatus) -> DiscoveredSession {
         DiscoveredSession {
             path: std::path::PathBuf::from(format!("/tmp/s-{quick:?}")),
+            sid: String::new(),
             agent: AgentKind::ClaudeCode,
             model: None,
             cwd: None,
@@ -1215,18 +925,10 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut dash: Dashboard) -> std::io::
         crossterm::event::EnableMouseCapture
     )?;
 
-    // Auto-load the initially selected session so its graph is shown on the
-    // first frame. Also pre-load any currently-Running sessions so they
-    // are visible in the Sessions view on first paint.
-    dash.ensure_loaded(dash.selected);
-    dash.autoload_running();
-
     // If anything is currently Running, auto-drill into the first one
     // so the user lands on the live activity without having to navigate.
     // Otherwise stay at the Repos view.
-    if !dash.focus_first_running() {
-        // nav_path already empty; nothing to do.
-    }
+    let _ = dash.focus_first_running();
 
     let mut last_draw = Instant::now();
     loop {
