@@ -426,6 +426,60 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
                 }
                 return tree::SessionStatus::Running;
             }
+            "response_item" => {
+                // Codex envelope. Inner event is keyed by `payload.type`:
+                //   custom_tool_call   / function_call         — Running unless completed
+                //   custom_tool_call_output / function_call_output with is_error — Failed
+                //   custom_tool_call_output (no error)  — Done (matched call resolved)
+                //   message                            — Done (assistant finished a turn)
+                //   user_message                       — Running (agent hasn't replied)
+                let payload = match v.get("payload") {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let ptype = payload
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                match ptype {
+                    "custom_tool_call" | "function_call" => {
+                        let status = payload
+                            .get("status")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        if status == "completed" {
+                            // Tool finished executing; the matching output
+                            // will be on the NEXT line (we walked backwards
+                            // from EOF). Keep scanning back so we don't
+                            // mis-report a stale completed call as Running.
+                            continue;
+                        }
+                        return tree::SessionStatus::Running;
+                    }
+                    "custom_tool_call_output" | "function_call_output" => {
+                        if payload
+                            .get("is_error")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false)
+                        {
+                            return tree::SessionStatus::Failed;
+                        }
+                        // Clean output → keep scanning so a later
+                        // pending tool call or user_message can flip us
+                        // to Running.
+                        continue;
+                    }
+                    "message" => {
+                        return tree::SessionStatus::Done;
+                    }
+                    "user_message" => {
+                        return tree::SessionStatus::Running;
+                    }
+                    _ => continue,
+                }
+            }
+            // event_msg (token_count, item_completed, turn_started, …) and
+            // session_meta carry no status information — keep scanning.
             _ => continue,
         }
     }
@@ -666,6 +720,73 @@ mod tests {
         let path = write_temp_jsonl("buf_end", &buf);
         let s = super::quick_status(&path);
         assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Codex envelope — `quick_status` walks the last 64 KiB of the JSONL
+    // and looks at the final non-empty line. With codex's `response_item`
+    // envelope, the relevant inner payload lives under `payload.type`.
+
+    #[test]
+    fn quick_status_codex_pending_tool_call_is_running() {
+        let path = write_temp_jsonl(
+            "codex_running",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"]}}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_x\",\"name\":\"exec\",\"input\":\"...\",\"status\":\"in_progress\"}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_codex_tool_error_is_failed() {
+        let path = write_temp_jsonl(
+            "codex_failed",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_x\",\"name\":\"exec\",\"input\":\"...\",\"status\":\"completed\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_x\",\"output\":\"oops\",\"is_error\":true}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Failed);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_codex_assistant_message_is_done() {
+        let path = write_temp_jsonl(
+            "codex_done",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_x\",\"name\":\"exec\",\"input\":\"...\",\"status\":\"completed\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call_x\",\"output\":\"ok\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"all done\"}]}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Done);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_codex_user_message_is_running() {
+        let path = write_temp_jsonl(
+            "codex_user_msg",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"user_message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"continue\"}]}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Running);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quick_status_codex_event_msg_is_ignored() {
+        // Token-count event_msg at the very end shouldn't change the status
+        // resolved from the response_item above it.
+        let path = write_temp_jsonl(
+            "codex_event_msg",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{}}}\n",
+        );
+        let s = super::quick_status(&path);
+        assert_eq!(s, tree::SessionStatus::Done);
         let _ = std::fs::remove_file(&path);
     }
 }
