@@ -18,7 +18,7 @@ use crate::tree::SessionStatus;
 
 const MAX_SESSIONS: usize = 32;
 const TAIL_POLL_BUDGET: Duration = Duration::from_millis(250);
-const REDISCOVERY_BUDGET: Duration = Duration::from_secs(5);
+const REDISCOVERY_BUDGET: Duration = Duration::from_secs(1);
 
 /// Per-session polling state. Cheap: just the current status + the last
 /// file mtime we observed. We poll mtime on every tick; if unchanged, we
@@ -207,11 +207,6 @@ impl Dashboard {
         }
         if self.selected >= self.nav_items().len() {
             self.selected = self.nav_items().len().saturating_sub(1);
-        }
-        // If a brand-new running session was just discovered, drill
-        // into it automatically so the user doesn't have to navigate.
-        if self.nav_path.is_empty() {
-            self.focus_first_running();
         }
         let _ = before;
         self.last_discovery = Instant::now();
@@ -914,6 +909,36 @@ mod tests {
         d.toggle_expand();
         assert!(d.expanded.is_none());
     }
+
+    // No auto-drill on startup. The user always lands at the Repos view
+    // and navigates manually — auto-drilling hid the cross-repo summary
+    // and made it harder to compare activity across projects.
+
+    #[test]
+    fn from_report_keeps_nav_path_empty_even_with_running_sessions() {
+        // `from_report` itself never calls `focus_first_running`; the
+        // regression we guard against is the runtime loop adding it back.
+        let mut s = sess_with_status(crate::tree::SessionStatus::Running);
+        s.repo_name = Some("agent-graph-tui".into());
+        s.branch = Some("main".into());
+        s.modified = Some(std::time::SystemTime::now());
+        let d = dash_for(vec![s]);
+        assert!(
+            d.nav_path.is_empty(),
+            "Dashboard must start at Repos view (no auto-drill)"
+        );
+    }
+
+    // Rediscovery budget is short enough that a brand-new session shows
+    // up in the dashboard within ~1 s instead of the previous 5 s.
+
+    #[test]
+    fn rediscovery_budget_is_at_most_one_second() {
+        assert!(
+            REDISCOVERY_BUDGET <= std::time::Duration::from_secs(1),
+            "new sessions should appear within ~1s (was 5s, felt laggy)"
+        );
+    }
 }
 
 /// App loop for dashboard mode: rediscovery + tails + keyboard.
@@ -925,11 +950,9 @@ pub fn run<B: Backend>(term: &mut Terminal<B>, mut dash: Dashboard) -> std::io::
         crossterm::event::EnableMouseCapture
     )?;
 
-    // If anything is currently Running, auto-drill into the first one
-    // so the user lands on the live activity without having to navigate.
-    // Otherwise stay at the Repos view.
-    let _ = dash.focus_first_running();
-
+    // Always start at the Repos view. Auto-drilling into a running session
+    // hid the cross-repo summary and made it harder to compare activity
+    // across projects. The user navigates manually with Enter / Backspace.
     let mut last_draw = Instant::now();
     loop {
         dash.tick_discovery();
