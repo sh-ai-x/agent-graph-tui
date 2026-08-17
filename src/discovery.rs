@@ -285,33 +285,97 @@ fn scan_one(path: &Path) -> Option<DiscoveredSession> {
 
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
-    // Read up to 8 KiB of head — just enough to pick up the cwd field for
-    // git enrichment. We no longer extract model / task / node_count on
-    // disk; the simplified dashboard only needs sid + status.
-    let mut head = vec![0u8; 8 * 1024];
+    // Read up to 64 KiB so we likely cover the first assistant message
+    // (model field) AND the first user message (task / cwd fields). 8 KiB
+    // was too small — sessions with long preamble or large tool blocks
+    // push the first assistant message past that.
+    let mut head = vec![0u8; 64 * 1024];
     let n = f.read(&mut head).unwrap_or(0);
     head.truncate(n);
     let head_str = std::str::from_utf8(&head).unwrap_or("");
 
     let agent = AgentKind::from_path(path);
+    let model = extract_model(path);
     let cwd = extract_cwd(head_str);
     let worktree_name = extract_worktree_name(path);
+    let task = first_user_message(head_str);
+
+    let node_count_proxy = head_str.bytes().filter(|&b| b == b'\n').count();
 
     Some(DiscoveredSession {
         path: path.to_path_buf(),
         sid: extract_sid(path),
         agent,
-        model: None,
+        model,
         cwd,
         worktree_name,
         branch: None,
         repo_name: None,
         quick_status: quick_status(path),
-        task: None,
+        task,
         size_bytes: size,
         modified,
-        node_count_proxy: 0,
+        node_count_proxy,
     })
+}
+
+fn first_user_message(head: &str) -> Option<String> {
+    for line in head.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        // User message — could be plain string content or content array with
+        // text/tool_result blocks. Extract the first text block, falling back
+        // to a plain string content. Also accept Codex's `response_item`
+        // envelope whose payload carries role=user.
+        let is_user = v.get("type").and_then(|t| t.as_str()) == Some("user")
+            || v.get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("user")
+            || (v.get("type").and_then(|t| t.as_str()) == Some("response_item")
+                && v.get("payload")
+                    .and_then(|p| p.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("user_message"));
+        if !is_user {
+            break;
+        }
+        let content = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .or_else(|| v.get("payload").and_then(|p| p.get("content")))?;
+        if let Some(s) = content.as_str() {
+            return Some(unescape(s));
+        }
+        if let Some(arr) = content.as_array() {
+            for b in arr {
+                // Claude Code uses "text"; codex envelope uses
+                // "input_text" / "output_text".
+                let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if btype == "text" || btype == "input_text" || btype == "output_text" {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        return Some(unescape(t));
+                    }
+                }
+            }
+        }
+        break;
+    }
+    None
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("\\n", " ")
+        .replace("\\\"", "\"")
+        .replace("\\t", " ")
+        .trim()
+        .to_string()
 }
 
 /// Derive a short, stable session id from the JSONL filename. For Codex's
@@ -486,6 +550,53 @@ pub fn quick_status(path: &Path) -> tree::SessionStatus {
     tree::SessionStatus::Done
 }
 
+/// Walk a JSONL value looking for a model field at any of the
+/// known locations (Claude Code: `message.model`; Codex envelope:
+/// `payload.model`; some legacy: `response.model` / top-level `model`).
+fn model_from_value(v: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        v.get("message").and_then(|m| m.get("model")),
+        v.get("payload").and_then(|p| p.get("model")),
+        v.get("response").and_then(|r| r.get("model")),
+        v.get("model"),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|m| m.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Walk up to `MODEL_SCAN_BYTES` of the file, line by line, looking for
+/// the first JSONL line that has a model field. Most sessions put the
+/// model in the first 8-20 KiB; 64 KiB is a safe upper bound.
+const MODEL_SCAN_BYTES: u64 = 64 * 1024;
+
+fn extract_model(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let read_up_to = len.min(MODEL_SCAN_BYTES);
+    let mut buf = vec![0u8; read_up_to as usize];
+    let _ = f.read(&mut buf).ok()?;
+    let text = std::str::from_utf8(&buf).unwrap_or("");
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(m) = model_from_value(&v) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Pulls the worktree name out of the project dir's `--worktrees-X` suffix,
 /// when the session was started inside a git worktree. Returns `None` for
 /// sessions started in the main repo.
@@ -615,6 +726,108 @@ mod tests {
         let _ = std::fs::remove_file(&path); // ensure no leftover from previous run
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn first_user_message_extracts_initial_prompt() {
+        let head = r#"{"type":"user","message":{"role":"user","content":"hello world"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+"#;
+        let m = super::first_user_message(head).unwrap();
+        assert_eq!(m, "hello world");
+    }
+
+    #[test]
+    fn first_user_message_handles_escaped_quotes() {
+        let head = r#"{"type":"user","message":{"role":"user","content":"say \\\"hi\\\" to me"}}
+"#;
+        let m = super::first_user_message(head).unwrap();
+        assert!(m.contains("hi"));
+    }
+
+    #[test]
+    fn first_user_message_handles_content_array_text_block() {
+        let head = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"from array"}]}}
+"#;
+        let m = super::first_user_message(head).unwrap();
+        assert_eq!(m, "from array");
+    }
+
+    #[test]
+    fn first_user_message_handles_codex_envelope() {
+        let head = r#"{"type":"response_item","payload":{"type":"user_message","content":[{"type":"input_text","text":"codex prompt"}]}}
+"#;
+        let m = super::first_user_message(head).unwrap();
+        assert_eq!(m, "codex prompt");
+    }
+
+    #[test]
+    fn first_user_message_returns_none_when_first_line_is_assistant() {
+        let head = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+"#;
+        assert!(super::first_user_message(head).is_none());
+    }
+
+    #[test]
+    fn extract_model_picks_up_message_model_field() {
+        let path = std::env::temp_dir().join(format!("agent-graph-tui-model-msg-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n",
+        )
+        .unwrap();
+        let m = super::extract_model(&path).unwrap();
+        assert_eq!(m, "claude-opus-4-8");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_picks_up_payload_model_field_for_codex() {
+        let path = std::env::temp_dir().join(format!("agent-graph-tui-model-payload-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"content\":[]}}\n",
+        )
+        .unwrap();
+        let m = super::extract_model(&path).unwrap();
+        assert_eq!(m, "gpt-5.4");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_picks_up_top_level_model_field() {
+        let path = std::env::temp_dir().join(format!("agent-graph-tui-model-top-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"{\"model\":\"minimax-m3\"}\n").unwrap();
+        let m = super::extract_model(&path).unwrap();
+        assert_eq!(m, "minimax-m3");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_returns_none_when_no_model_field_anywhere() {
+        let path = std::env::temp_dir().join(format!("agent-graph-tui-model-none-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n").unwrap();
+        assert!(super::extract_model(&path).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extract_model_picks_up_model_in_later_lines_not_just_head() {
+        let path = std::env::temp_dir().join(format!("agent-graph-tui-model-late-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut body = String::new();
+        for _ in 0..50 {
+            body.push_str("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"padding\"}}\n");
+        }
+        body.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n");
+        std::fs::write(&path, body).unwrap();
+        let m = super::extract_model(&path).unwrap();
+        assert_eq!(m, "claude-opus-4-8");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
